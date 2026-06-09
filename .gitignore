@@ -1,0 +1,25 @@
+# Generated reports can contain device identifiers.
+*_SystemReport.html
+*SystemReport*.html
+
+# Test output and generated certificates/reports.
+BurnInTest/
+Test Certificates/
+
+# OS and removable-drive metadata.
+.DS_Store
+._*
+.Spotlight-V100/
+.Trashes/
+.TemporaryItems/
+.fseventsd/
+System Volume Information/
+
+# Firmware/manual/bulk artifacts that are not part of this source repo.
+*.zip
+*.pdf
+*.2D0
+
+# Local editor files.
+*.swp
+*.tmp
