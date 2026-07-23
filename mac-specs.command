@@ -1,4 +1,4 @@
-#!/bin/zsh
+#!/bin/bash
 
 cd "$(dirname "$0")"
 
@@ -12,12 +12,14 @@ MODEL_ID=$(system_profiler SPHardwareDataType | awk -F': ' '/Model Identifier/ {
 DISPLAY_MODEL="${MODEL} (${MODEL_ID})"
 
 SERIAL=$(system_profiler SPHardwareDataType | awk -F': ' '/Serial Number/ {print $2}' | xargs)
-CPU=$(sysctl -n machdep.cpu.brand_string)
+CPU=$(sysctl -n machdep.cpu.brand_string 2>/dev/null)
+if [ -z "$CPU" ]; then CPU=$(system_profiler SPHardwareDataType | awk -F': ' '/Processor Name/ {print $2; exit}' | xargs); fi
 RAM_BYTES=$(sysctl -n hw.memsize)
 RAM_GB=$(( RAM_BYTES / 1073741824 ))
 OS_VER=$(sw_vers -productVersion)
 OS_BUILD=$(sw_vers -buildVersion)
-COMP_NAME=$(scutil --get ComputerName)
+COMP_NAME=$(scutil --get ComputerName 2>/dev/null)
+if [ -z "$COMP_NAME" ]; then COMP_NAME=$(hostname); fi
 
 # ---------- RAM SECTION (Advanced Block Parsing) ----------
 RAM_HTML=""
@@ -49,6 +51,7 @@ RAM_HTML="${RAM_HTML}<tr><td colspan='6' style='text-align:left; padding-left:40
 
 # ---------- DISPLAY & GRAPHICS (Multi-GPU Parsing) ----------
 RESOLUTION=$(system_profiler SPDisplaysDataType | grep "Resolution:" | head -n 1 | awk -F': ' '{print $2}' | xargs)
+if [ -z "$RESOLUTION" ]; then RESOLUTION="Unknown"; fi
 GPU_HTML=""
 
 # Parse ALL detected GPUs (Apple, Intel, AMD, NVIDIA)
@@ -68,7 +71,7 @@ done < <(system_profiler SPDisplaysDataType | awk '
 
         vram="Unknown"
         vendor="Unknown"
-        driver="Apple Native/Metal"
+        driver="Apple Native"
     }
 
     /VRAM/ {
@@ -129,72 +132,42 @@ done < <(system_profiler SPDisplaysDataType | awk '
 # ---------- STORAGE SECTION ----------
 DISK_HTML=""
 
-# Prefer diskutil because it reports each internal physical drive separately.
-while IFS= read -r disk_id; do
-    if [ -z "$disk_id" ]; then continue; fi
-
-    IFS="|" read -r d_model d_size d_bus d_ssd < <(diskutil info "$disk_id" 2>/dev/null | awk -F': *' '
-        function clean(v) { sub(/^[ \t]+/, "", v); sub(/[ \t]+$/, "", v); return v }
-        /^[ \t]*Device \/ Media Name:/ { model=clean($2) }
-        /^[ \t]*Disk Size:/ { size=clean($2); sub(/[ \t]*\(.*/, "", size) }
-        /^[ \t]*Protocol:/ { bus=clean($2) }
-        /^[ \t]*Solid State:/ { ssd=clean($2) }
-        END { print model "|" size "|" bus "|" ssd }
-    ')
-
-    d_model="${d_model% Media}"
-    if [ -z "$d_model" ]; then d_model="$disk_id"; fi
+# Query each storage data type separately. Lion ignores the newer NVMe type while
+# later macOS versions still report it.
+while IFS="|" read -r d_model d_size d_type d_bus; do
+    if [ -z "$d_model" ]; then continue; fi
     if [ -z "$d_size" ]; then d_size="Unknown"; fi
+    if [ -z "$d_type" ]; then d_type="Unknown"; fi
     if [ -z "$d_bus" ]; then d_bus="Unknown"; fi
-
-    case "$d_bus" in
-        *PCI*) d_bus="PCIe/NVMe" ;;
-        *SATA*) d_bus="SATA" ;;
-    esac
-
-    case "$d_ssd" in
-        Yes) d_type="Solid State" ;;
-        No) d_type="Hard Disk" ;;
-        *)
-            if [[ "$d_model" == *SSD* ]]; then
-                d_type="Solid State"
-            elif [[ "$d_model" == *HDD* ]]; then
-                d_type="Hard Disk"
-            else
-                d_type="Unknown"
-            fi
-            ;;
-    esac
-
     DISK_HTML="${DISK_HTML}<tr><td>${d_model}</td><td>${d_size}</td><td>${d_type}</td><td>${d_bus}</td></tr>"
 done < <(
-    { diskutil list internal physical 2>/dev/null; diskutil list 2>/dev/null; } |
-    awk '/^\/dev\/disk[0-9]+/ && /internal, physical/ { if (!seen[$1]++) print $1 }'
-)
-
-# Fallback for older systems where diskutil does not expose internal physical filters.
-if [ -z "$DISK_HTML" ]; then
-    while IFS="|" read -r d_model d_size d_type d_bus; do
-        if [ -z "$d_model" ]; then continue; fi
-        if [ -z "$d_size" ]; then d_size="Unknown"; fi
-        if [ -z "$d_type" ]; then d_type="Unknown"; fi
-        if [ -z "$d_bus" ]; then d_bus="Unknown"; fi
-        DISK_HTML="${DISK_HTML}<tr><td>${d_model}</td><td>${d_size}</td><td>${d_type}</td><td>${d_bus}</td></tr>"
-    done < <(system_profiler SPNVMeDataType SPSerialATADataType SPATADataType 2>/dev/null | awk -F': *' '
+    for profiler_type in SPSerialATADataType SPATADataType SPNVMeDataType; do
+        if [ "$profiler_type" = "SPSerialATADataType" ]; then
+            profiler_bus="SATA"
+        elif [ "$profiler_type" = "SPATADataType" ]; then
+            profiler_bus="ATA"
+        else
+            profiler_bus="PCIe/NVMe"
+        fi
+        printf '__REPORT_BUS__:%s\n' "$profiler_bus"
+        system_profiler "$profiler_type" 2>/dev/null
+    done | awk -F': *' '
         function clean(v) { sub(/^[ \t]+/, "", v); sub(/[ \t]+$/, "", v); return v }
         function emit() {
             if (model == "") return
             lower=tolower(model)
             if (type == "") {
-                if (lower ~ /ssd/ || bus == "NVMe") type="Solid State"
+                if (lower ~ /ssd/ || bus == "PCIe/NVMe") type="Solid State"
                 else if (lower ~ /hdd/ || lower ~ /hard/) type="Hard Disk"
                 else type="Unknown"
             }
             print model "|" size "|" type "|" bus
         }
-        /^NVMExpress:/ { bus="NVMe"; next }
-        /^SATA/ { bus="SATA"; next }
-        /^ATA:/ { bus="ATA"; next }
+        /^__REPORT_BUS__:/ {
+            emit()
+            model=""; size=""; type=""; bus=clean($2)
+            next
+        }
         /^[ \t]*Model:/ {
             emit()
             model=clean($2); size=""; type=""
@@ -212,7 +185,49 @@ if [ -z "$DISK_HTML" ]; then
             next
         }
         END { emit() }
-    ')
+    '
+)
+
+# Fall back to diskutil for Macs whose profiler output omits drive model fields.
+if [ -z "$DISK_HTML" ]; then
+    while IFS= read -r disk_id; do
+        if [ -z "$disk_id" ]; then continue; fi
+        disk_info=$(diskutil info "$disk_id" 2>/dev/null)
+        d_location=$(printf '%s\n' "$disk_info" | awk -F': *' '/^[ \t]*(Internal|Device Location):/ {print $2; exit}')
+        case "$d_location" in
+            No|External) continue ;;
+        esac
+
+        IFS="|" read -r d_model d_size d_bus d_ssd < <(printf '%s\n' "$disk_info" | awk -F': *' '
+            function clean(v) { sub(/^[ \t]+/, "", v); sub(/[ \t]+$/, "", v); return v }
+            /^[ \t]*Device \/ Media Name:/ { model=clean($2) }
+            /^[ \t]*(Disk Size|Total Size):/ { size=clean($2); sub(/[ \t]*\(.*/, "", size) }
+            /^[ \t]*(Protocol|Bus Protocol):/ { bus=clean($2) }
+            /^[ \t]*Solid State:/ { ssd=clean($2) }
+            END { print model "|" size "|" bus "|" ssd }
+        ')
+
+        d_model="${d_model% Media}"
+        if [ -z "$d_model" ]; then d_model="$disk_id"; fi
+        if [ -z "$d_size" ]; then d_size="Unknown"; fi
+        if [ -z "$d_bus" ]; then d_bus="Unknown"; fi
+        case "$d_bus" in
+            *PCI*) d_bus="PCIe/NVMe" ;;
+            *SATA*) d_bus="SATA" ;;
+        esac
+        case "$d_ssd" in
+            Yes) d_type="Solid State" ;;
+            No) d_type="Hard Disk" ;;
+            *)
+                case "$d_model" in
+                    *SSD*) d_type="Solid State" ;;
+                    *HDD*) d_type="Hard Disk" ;;
+                    *) d_type="Unknown" ;;
+                esac
+                ;;
+        esac
+        DISK_HTML="${DISK_HTML}<tr><td>${d_model}</td><td>${d_size}</td><td>${d_type}</td><td>${d_bus}</td></tr>"
+    done < <(diskutil list 2>/dev/null | awk '/^\/dev\/disk[0-9]+/ { if (!seen[$1]++) print $1 }')
 fi
 
 if [ -z "$DISK_HTML" ]; then
@@ -220,7 +235,7 @@ if [ -z "$DISK_HTML" ]; then
 fi
 
 # ---------- BATTERY HEALTH ----------
-BATTERY_HTML="<p style='font-size: var(--font-small); margin: 8px 0;'>No Battery Detected</p>"
+BATTERY_HTML="<p style='font-size: 12px; margin: 8px 0;'>No Battery Detected</p>"
 if system_profiler SPHardwareDataType | grep -q "MacBook"; then
     DESIGN_CAP=$(ioreg -rn AppleSmartBattery | grep '"DesignCapacity" =' | awk '{print $3}')
     MAX_CAP=$(ioreg -rn AppleSmartBattery | grep '"AppleRawMaxCapacity" =' | awk '{print $3}')
@@ -245,32 +260,43 @@ cat << EOF > "$OUTPUT_PATH"
 <meta charset="UTF-8">
 <title>System Report - ${SERIAL}</title>
 <style>
-:root {
-    --bg-color: #eef2f5; --card-bg: #ffffff; --text-main: #333333;
-    --brand-blue: #236c9b; --gradient: linear-gradient(135deg, #167a96 0%, #4fb456 100%);
-    --border-color: #d1d9e0;
-    --font-base: clamp(11px, 1.8vh, 16px); --font-small: clamp(10px, 1.5vh, 14px);
-    --font-h1: clamp(18px, 3vh, 26px); --font-h2: clamp(13px, 2.2vh, 18px);
-    --pad-sm: 8px; --pad-md: 12px; --pad-lg: 16px; --gap-size: 16px;
+* { -webkit-box-sizing: border-box; box-sizing: border-box; }
+html, body { margin: 0; padding: 0; min-width: 720px; }
+body {
+    padding: 16px; font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+    background: #eef2f5; color: #333333;
 }
-* { box-sizing: border-box; }
-body { 
-    margin: 0; padding: var(--pad-lg); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; 
-    background: var(--bg-color); color: var(--text-main); display: flex; flex-direction: column; 
-    height: 100vh; width: 100vw; overflow: hidden; 
+.header-container {
+    overflow: hidden; margin-bottom: 16px; padding: 12px 16px;
+    background: #167a96; color: white;
+    -webkit-border-radius: 6px; border-radius: 6px;
+    -webkit-box-shadow: 0 2px 4px rgba(0,0,0,0.1); box-shadow: 0 2px 4px rgba(0,0,0,0.1);
 }
-.header-container { display: flex; justify-content: space-between; align-items: center; margin-bottom: var(--gap-size); padding: var(--pad-md) var(--pad-lg); background: var(--gradient); border-radius: 6px; color: white; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
-h1 { margin: 0; font-size: var(--font-h1); }
-.container { display: flex; gap: var(--gap-size); flex: 1; min-height: 0; }
-.column { flex: 1; display: flex; flex-direction: column; gap: var(--gap-size); min-height: 0; }
-.section { background: var(--card-bg); border-radius: 6px; padding: var(--pad-md) var(--pad-lg); border: 1px solid var(--border-color); box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
-.section h2 { margin: 0 0 var(--pad-md) 0; font-size: var(--font-h2); color: var(--brand-blue); text-transform: uppercase; border-bottom: 1px solid var(--border-color); padding-bottom: 4px; }
-.info-grid { display: grid; grid-template-columns: 30% auto; row-gap: 8px; font-size: var(--font-base); }
-.label { font-weight: 600; color: #555; }
-table { width: 100%; border-collapse: collapse; font-size: var(--font-base); }
-th { background: #f1f5f8; color: var(--brand-blue); padding: 8px; text-align: left; border-bottom: 1px solid var(--border-color); }
+.logo-container { float: left; }
+h1 { float: right; margin: 10px 0 0 20px; font-size: 24px; font-weight: 600; }
+.container { width: 100%; overflow: hidden; }
+.column { float: left; width: 49%; }
+.column + .column { float: right; }
+.section {
+    margin-bottom: 16px; padding: 12px 16px; background: #ffffff;
+    border: 1px solid #d1d9e0; -webkit-border-radius: 6px; border-radius: 6px;
+    -webkit-box-shadow: 0 1px 3px rgba(0,0,0,0.05); box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+}
+.section h2 {
+    margin: 0 0 12px 0; padding-bottom: 4px; font-size: 16px;
+    color: #236c9b; text-transform: uppercase; border-bottom: 1px solid #d1d9e0;
+}
+.info-grid { overflow: hidden; font-size: 14px; line-height: 20px; }
+.info-grid .label { float: left; clear: left; width: 30%; font-weight: bold; color: #555555; }
+.info-grid .label + div { margin-left: 32%; min-height: 20px; padding-bottom: 6px; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th { background: #f1f5f8; color: #236c9b; padding: 8px; text-align: left; border-bottom: 1px solid #d1d9e0; }
 td { padding: 8px; border-bottom: 1px solid #eaeaea; }
-.footer { text-align: right; font-size: var(--font-small); color: #888; margin-top: auto; padding-top: 10px; }
+.footer { clear: both; text-align: right; font-size: 12px; color: #888888; padding-top: 10px; }
+@media screen and (max-width: 900px) {
+    html, body { min-width: 0; }
+    .column, .column + .column { float: none; width: 100%; }
+}
 </style>
 </head>
 <body>
@@ -326,7 +352,7 @@ td { padding: 8px; border-bottom: 1px solid #eaeaea; }
         </div>
     </div>
 </div>
-<div class="footer">Generated on ${REPORT_DATE} via ZSH</div>
+<div class="footer">Generated on ${REPORT_DATE} via Bash</div>
 </body>
 </html>
 EOF

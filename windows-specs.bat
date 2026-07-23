@@ -110,6 +110,82 @@ if ($null -eq $Resolution) {
 # ---------- BATTERY INFO ----------
 $Battery = Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue
 
+# ---------- TOUCHSCREEN INFO ----------
+# SM_DIGITIZER and SM_MAXIMUMTOUCHES are the same Windows metrics used by
+# system UI to describe pen and touch capability.
+$TouchscreenStatus = "Unknown"
+try {
+    if (-not ("SpecsReportNativeMethods" -as [type])) {
+        Add-Type -TypeDefinition @"
+using System.Runtime.InteropServices;
+public static class SpecsReportNativeMethods {
+    [DllImport("user32.dll")]
+    public static extern int GetSystemMetrics(int nIndex);
+}
+"@ -ErrorAction Stop
+    }
+
+    $DigitizerFlags = [SpecsReportNativeMethods]::GetSystemMetrics(94)
+    $MaximumTouches = [SpecsReportNativeMethods]::GetSystemMetrics(95)
+    $HasTouchHardware = (
+        (($DigitizerFlags -band 0x01) -ne 0) -or
+        (($DigitizerFlags -band 0x02) -ne 0) -or
+        ($MaximumTouches -gt 0)
+    )
+
+    if ($HasTouchHardware) {
+        if ($MaximumTouches -gt 0) {
+            $TouchscreenStatus = "Yes ($MaximumTouches touch points)"
+        } else {
+            $TouchscreenStatus = "Yes"
+        }
+    } else {
+        $TouchscreenStatus = "No"
+    }
+} catch {
+    $TouchDevice = Get-CimInstance Win32_PnPEntity -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match "touch\s*screen|touchscreen" -and $_.Status -eq "OK" } |
+        Select-Object -First 1
+    if ($TouchDevice) { $TouchscreenStatus = "Yes" }
+}
+
+# ---------- WINDOWS ACTIVATION ----------
+# This reads only the license state. It does not include or expose a product key.
+$WindowsActivationStatus = "Unknown"
+$WindowsLicenses = $null
+try {
+    $WindowsLicenses = Get-CimInstance -ClassName SoftwareLicensingProduct `
+        -Filter "ApplicationID='55c92734-d682-4d71-983e-d6ec3f16059f'" `
+        -ErrorAction Stop
+} catch {
+    if (Get-Command Get-WmiObject -ErrorAction SilentlyContinue) {
+        $WindowsLicenses = Get-WmiObject -Class SoftwareLicensingProduct `
+            -Filter "ApplicationID='55c92734-d682-4d71-983e-d6ec3f16059f'" `
+            -ErrorAction SilentlyContinue
+    }
+}
+
+$WindowsLicenseCandidates = @($WindowsLicenses |
+    Where-Object { $_.Description -match "Windows" -and -not [string]::IsNullOrWhiteSpace([string]$_.PartialProductKey) })
+$WindowsLicense = $WindowsLicenseCandidates |
+    Where-Object { $_.LicenseStatus -eq 1 } |
+    Select-Object -First 1
+if (-not $WindowsLicense) {
+    $WindowsLicense = $WindowsLicenseCandidates | Select-Object -First 1
+}
+
+if ($WindowsLicense) {
+    $WindowsActivationStatus = switch ([int]$WindowsLicense.LicenseStatus) {
+        1 { "Activated" }
+        2 { "Not activated (initial grace period)" }
+        3 { "Not activated (additional grace period)" }
+        4 { "Not activated (non-genuine grace period)" }
+        5 { "Not activated (notification mode)" }
+        6 { "Not activated (extended grace period)" }
+        Default { "Not activated" }
+    }
+}
+
 # ---------- FUNCTIONS ----------
 function Get-RamType($SMBIOSMemoryType) {
     switch ($SMBIOSMemoryType) {
@@ -641,6 +717,8 @@ tr:last-child td {
                 <div class="label">Installed RAM</div><div>$TotalSystemRAMGB GB</div>
                 <div class="label">Windows Version</div><div>$($OS.Caption)</div>
                 <div class="label">Build Number</div><div>$($OS.BuildNumber)</div>
+                <div class="label">Windows Activation</div><div>$(HtmlValue $WindowsActivationStatus)</div>
+                <div class="label">Touchscreen</div><div>$(HtmlValue $TouchscreenStatus)</div>
                 <div class="label">BIOS Version</div><div>$($BIOS.SMBIOSBIOSVersion)</div>
                 <div class="label">Computer Name</div><div>$env:COMPUTERNAME</div>
             </div>
