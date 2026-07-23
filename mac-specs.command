@@ -219,8 +219,12 @@ if [ -z "$DISK_HTML" ]; then
         if [ -z "$disk_id" ]; then continue; fi
         disk_info=$(diskutil info "$disk_id" 2>/dev/null)
         d_location=$(printf '%s\n' "$disk_info" | awk -F': *' '/^[ \t]*(Internal|Device Location):/ {print $2; exit}')
+        d_virtual=$(printf '%s\n' "$disk_info" | awk -F': *' '/^[ \t]*Virtual:/ {print $2; exit}')
         case "$d_location" in
             No|External) continue ;;
+        esac
+        case "$d_virtual" in
+            Yes) continue ;;
         esac
 
         IFS="|" read -r d_model d_size d_bus d_ssd < <(printf '%s\n' "$disk_info" | awk -F': *' '
@@ -265,8 +269,12 @@ while IFS= read -r disk_id; do
     if [ -z "$disk_id" ]; then continue; fi
     disk_info=$(diskutil info "$disk_id" 2>/dev/null)
     d_location=$(printf '%s\n' "$disk_info" | awk -F': *' '/^[ \t]*(Internal|Device Location):/ {print $2; exit}')
+    d_virtual=$(printf '%s\n' "$disk_info" | awk -F': *' '/^[ \t]*Virtual:/ {print $2; exit}')
     case "$d_location" in
         No|External) continue ;;
+    esac
+    case "$d_virtual" in
+        Yes) continue ;;
     esac
     smart_model=$(printf '%s\n' "$disk_info" | awk -F': *' '/^[ \t]*Device \/ Media Name:/ {print $2; exit}')
     smart_status=$(printf '%s\n' "$disk_info" | awk -F': *' '/^[ \t]*SMART Status:/ {print $2; exit}')
