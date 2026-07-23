@@ -7,19 +7,27 @@ LOGO_BASE64="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAlYAAADLCAYAAACswt2rA
 
 # ---------- GATHER SYSTEM INFO ----------
 MANUFACTURER="Apple Inc."
-MODEL=$(system_profiler SPHardwareDataType | awk -F': ' '/Model Name/ {print $2}' | xargs)
-MODEL_ID=$(system_profiler SPHardwareDataType | awk -F': ' '/Model Identifier/ {print $2}' | xargs)
+HARDWARE_PROFILE=$(system_profiler SPHardwareDataType 2>/dev/null)
+MEMORY_PROFILE=$(system_profiler SPMemoryDataType 2>/dev/null)
+DISPLAY_PROFILE=$(system_profiler SPDisplaysDataType 2>/dev/null)
+MODEL=$(printf '%s\n' "$HARDWARE_PROFILE" | awk -F': ' '/Model Name/ {print $2}' | xargs)
+MODEL_ID=$(printf '%s\n' "$HARDWARE_PROFILE" | awk -F': ' '/Model Identifier/ {print $2}' | xargs)
 DISPLAY_MODEL="${MODEL} (${MODEL_ID})"
 
-SERIAL=$(system_profiler SPHardwareDataType | awk -F': ' '/Serial Number/ {print $2}' | xargs)
+SERIAL=$(printf '%s\n' "$HARDWARE_PROFILE" | awk -F': ' '/Serial Number/ {print $2}' | xargs)
 CPU=$(sysctl -n machdep.cpu.brand_string 2>/dev/null)
-if [ -z "$CPU" ]; then CPU=$(system_profiler SPHardwareDataType | awk -F': ' '/Processor Name/ {print $2; exit}' | xargs); fi
+if [ -z "$CPU" ]; then CPU=$(printf '%s\n' "$HARDWARE_PROFILE" | awk -F': ' '/Processor Name/ {print $2; exit}' | xargs); fi
 RAM_BYTES=$(sysctl -n hw.memsize)
 RAM_GB=$(( RAM_BYTES / 1073741824 ))
 OS_VER=$(sw_vers -productVersion)
 OS_BUILD=$(sw_vers -buildVersion)
 COMP_NAME=$(scutil --get ComputerName 2>/dev/null)
 if [ -z "$COMP_NAME" ]; then COMP_NAME=$(hostname); fi
+case "$MODEL" in
+    *MacBook*) IS_LAPTOP="Yes"; FORM_FACTOR="Laptop" ;;
+    iMac*|Mac\ Pro*|Mac\ mini*) IS_LAPTOP="No"; FORM_FACTOR="Desktop" ;;
+    *) IS_LAPTOP="No"; FORM_FACTOR="Other / Unknown" ;;
+esac
 
 # ---------- RAM SECTION (Advanced Block Parsing) ----------
 RAM_HTML=""
@@ -27,10 +35,13 @@ count=0
 
 # This awk block perfectly pairs Size, Type, Speed, Manufacturer, and Part Number per stick
 while IFS="|" read -r r_size r_type r_speed r_mfg r_part; do
-    if [ -z "$r_size" ] || [[ "$r_size" == *"empty"* ]]; then continue; fi
+    if [ -z "$r_size" ]; then continue; fi
+    case "$r_size" in
+        *[Ee][Mm][Pp][Tt][Yy]*) continue ;;
+    esac
     count=$((count + 1))
     RAM_HTML="${RAM_HTML}<tr><td>${count}</td><td>${r_size}</td><td>${r_type}</td><td>${r_speed}</td><td>${r_mfg}</td><td>${r_part}</td></tr>"
-done < <(system_profiler SPMemoryDataType | awk '
+done < <(printf '%s\n' "$MEMORY_PROFILE" | awk '
     /Size:/ {
         if (in_mod) { print size"|"type"|"speed"|"mfg"|"part }
         in_mod=1; size=$0; sub(/^[ \t]*Size: /, "", size);
@@ -43,6 +54,20 @@ done < <(system_profiler SPMemoryDataType | awk '
     END { if (in_mod) print size"|"type"|"speed"|"mfg"|"part }
 ')
 
+RAM_SLOTS_STATUS="Unknown (System Profiler did not report a reliable slot count)"
+IFS="|" read -r RAM_USED_SLOTS RAM_TOTAL_SLOTS < <(printf '%s\n' "$MEMORY_PROFILE" | awk '
+    /^[ \t]*Size:/ {
+        total++
+        value=tolower($0)
+        if (value !~ /empty/) used++
+    }
+    END { print used "|" total }
+')
+if [ -n "$RAM_TOTAL_SLOTS" ] && [ "$RAM_TOTAL_SLOTS" -gt 0 ] && [ "$RAM_TOTAL_SLOTS" -ge "$RAM_USED_SLOTS" ]; then
+    RAM_FREE_SLOTS=$(( RAM_TOTAL_SLOTS - RAM_USED_SLOTS ))
+    RAM_SLOTS_STATUS="${RAM_USED_SLOTS} used / ${RAM_TOTAL_SLOTS} total / ${RAM_FREE_SLOTS} free"
+fi
+
 # Apple Silicon Fallback (If no distinct sticks are found)
 if [ -z "$RAM_HTML" ]; then
     RAM_HTML="<tr><td>1</td><td>${RAM_GB} GB</td><td>Unified</td><td>N/A</td><td>Apple</td><td>Integrated</td></tr>"
@@ -50,7 +75,7 @@ fi
 RAM_HTML="${RAM_HTML}<tr><td colspan='6' style='text-align:left; padding-left:40px; font-weight:bold;'>Total Memory: ${RAM_GB} GB</td></tr>"
 
 # ---------- DISPLAY & GRAPHICS (Multi-GPU Parsing) ----------
-RESOLUTION=$(system_profiler SPDisplaysDataType | grep "Resolution:" | head -n 1 | awk -F': ' '{print $2}' | xargs)
+RESOLUTION=$(printf '%s\n' "$DISPLAY_PROFILE" | grep "Resolution:" | head -n 1 | awk -F': ' '{print $2}' | xargs)
 if [ -z "$RESOLUTION" ]; then RESOLUTION="Unknown"; fi
 GPU_HTML=""
 
@@ -59,7 +84,7 @@ while IFS="|" read -r g_name g_vram g_vendor g_driver; do
     if [ -z "$g_name" ]; then continue; fi
 
     GPU_HTML="${GPU_HTML}<tr><td>${g_name}</td><td>${g_vram}</td><td>${g_vendor}</td><td>${g_driver}</td></tr>"
-done < <(system_profiler SPDisplaysDataType | awk '
+done < <(printf '%s\n' "$DISPLAY_PROFILE" | awk '
     /Chipset Model:/ {
         # Print previous GPU before starting next
         if (gpu != "") {
@@ -234,9 +259,28 @@ if [ -z "$DISK_HTML" ]; then
     DISK_HTML="<tr><td>Unable to detect physical drives</td><td>Unknown</td><td>Unknown</td><td>Unknown</td></tr>"
 fi
 
+# ---------- BASIC SMART STATUS ----------
+SMART_HTML=""
+while IFS= read -r disk_id; do
+    if [ -z "$disk_id" ]; then continue; fi
+    disk_info=$(diskutil info "$disk_id" 2>/dev/null)
+    d_location=$(printf '%s\n' "$disk_info" | awk -F': *' '/^[ \t]*(Internal|Device Location):/ {print $2; exit}')
+    case "$d_location" in
+        No|External) continue ;;
+    esac
+    smart_model=$(printf '%s\n' "$disk_info" | awk -F': *' '/^[ \t]*Device \/ Media Name:/ {print $2; exit}')
+    smart_status=$(printf '%s\n' "$disk_info" | awk -F': *' '/^[ \t]*SMART Status:/ {print $2; exit}')
+    if [ -z "$smart_model" ]; then smart_model="$disk_id"; fi
+    if [ -z "$smart_status" ]; then smart_status="Not reported"; fi
+    SMART_HTML="${SMART_HTML}<tr><td>${smart_model}</td><td>${smart_status}</td></tr>"
+done < <(diskutil list 2>/dev/null | awk '/^\/dev\/disk[0-9]+/ { if (!seen[$1]++) print $1 }')
+if [ -z "$SMART_HTML" ]; then
+    SMART_HTML="<tr><td>Internal storage</td><td>Not reported</td></tr>"
+fi
+
 # ---------- BATTERY HEALTH ----------
 BATTERY_HTML="<p style='font-size: 12px; margin: 8px 0;'>No Battery Detected</p>"
-if system_profiler SPHardwareDataType | grep -q "MacBook"; then
+if [ "$IS_LAPTOP" = "Yes" ]; then
     DESIGN_CAP=$(ioreg -rn AppleSmartBattery | grep '"DesignCapacity" =' | awk '{print $3}')
     MAX_CAP=$(ioreg -rn AppleSmartBattery | grep '"AppleRawMaxCapacity" =' | awk '{print $3}')
     if [ -z "$MAX_CAP" ]; then MAX_CAP=$(ioreg -rn AppleSmartBattery | grep '"MaxCapacity" =' | awk '{print $3}'); fi
@@ -247,6 +291,144 @@ if system_profiler SPHardwareDataType | grep -q "MacBook"; then
         HEALTH=$(( MAX_CAP * 100 / DESIGN_CAP ))"%"
     fi
     BATTERY_HTML="<table><tr><th>Metric</th><th>Value</th></tr><tr><td>Design Capacity</td><td>${DESIGN_CAP:-N/A} mAh</td></tr><tr><td>Full Charge</td><td>${MAX_CAP:-N/A} mAh</td></tr><tr><td>Health</td><td>${HEALTH}</td></tr><tr><td>Cycles</td><td>${CYCLE_COUNT:-N/A}</td></tr></table>"
+fi
+
+# ---------- BUYER-FACING HARDWARE & MANAGEMENT CHECKS ----------
+LAPTOP_DISPLAY_HTML=""
+if [ "$IS_LAPTOP" = "Yes" ]; then
+    BUILTIN_DISPLAY_SIZE="Unknown (internal-panel EDID not reported)"
+    EDID_HEX=$(ioreg -lw0 -r -c AppleBacklightDisplay 2>/dev/null | awk -F'[<>]' '/IODisplayEDID/ {print $2; exit}' | tr -d ' ')
+    if [ "${#EDID_HEX}" -ge 46 ]; then
+        HORIZONTAL_CM_HEX=${EDID_HEX:42:2}
+        VERTICAL_CM_HEX=${EDID_HEX:44:2}
+        if [[ "$HORIZONTAL_CM_HEX" =~ ^[0-9A-Fa-f][0-9A-Fa-f]$ ]] && [[ "$VERTICAL_CM_HEX" =~ ^[0-9A-Fa-f][0-9A-Fa-f]$ ]]; then
+            HORIZONTAL_CM=$((16#$HORIZONTAL_CM_HEX))
+            VERTICAL_CM=$((16#$VERTICAL_CM_HEX))
+            if [ "$HORIZONTAL_CM" -gt 0 ] && [ "$VERTICAL_CM" -gt 0 ]; then
+                BUILTIN_DISPLAY_SIZE=$(awk -v h="$HORIZONTAL_CM" -v v="$VERTICAL_CM" 'BEGIN { printf "%.1f inches", sqrt((h*h)+(v*v))/2.54 }')
+            fi
+        fi
+    fi
+
+    BUILTIN_REFRESH_RATE="Unknown (not reported for the internal panel)"
+    DISPLAY_COUNT=$(printf '%s\n' "$DISPLAY_PROFILE" | awk '/Resolution:/ {count++} END {print count+0}')
+    if [ "$DISPLAY_COUNT" -eq 1 ] && printf '%s\n' "$DISPLAY_PROFILE" | grep -Eqi "Built-In:[[:space:]]*Yes|Display Type:.*Built"; then
+        REPORTED_REFRESH=$(printf '%s\n' "$DISPLAY_PROFILE" | awk -F': ' '/Refresh Rate:/ {print $2; exit}' | xargs)
+        if [ -n "$REPORTED_REFRESH" ]; then BUILTIN_REFRESH_RATE="$REPORTED_REFRESH"; fi
+    fi
+    LAPTOP_DISPLAY_HTML="<div class='label'>Built-in Display Size</div><div>${BUILTIN_DISPLAY_SIZE}</div><div class='label'>Built-in Refresh Rate</div><div>${BUILTIN_REFRESH_RATE}</div>"
+fi
+
+AIRPORT_PROFILE=$(system_profiler SPAirPortDataType 2>/dev/null)
+SUPPORTED_PHY=$(printf '%s\n' "$AIRPORT_PROFILE" | awk -F': ' '/Supported PHY Modes:/ {print $2; exit}' | xargs)
+case "$SUPPORTED_PHY" in
+    *802.11be*|*/be*) WIFI_GENERATION="Wi-Fi 7 (802.11be)" ;;
+    *802.11ax*|*/ax*) WIFI_GENERATION="Wi-Fi 6 class (802.11ax)" ;;
+    *802.11ac*|*/ac*) WIFI_GENERATION="Wi-Fi 5 (802.11ac)" ;;
+    *802.11n*|*/n*) WIFI_GENERATION="Wi-Fi 4 (802.11n)" ;;
+    "")
+        if printf '%s\n' "$AIRPORT_PROFILE" | grep -qi "AirPort\|Wi-Fi"; then
+            WIFI_GENERATION="Detected (generation not reported)"
+        else
+            WIFI_GENERATION="Not detected"
+        fi
+        ;;
+    *) WIFI_GENERATION="Legacy Wi-Fi (${SUPPORTED_PHY})" ;;
+esac
+
+ETHERNET_STATUS=""
+while IFS="|" read -r eth_port eth_device; do
+    if [ -z "$eth_device" ]; then continue; fi
+    eth_info=$(ifconfig "$eth_device" 2>/dev/null)
+    eth_media=$(printf '%s\n' "$eth_info" | awk -F'media: ' '/media:/ {print $2; exit}')
+    eth_active=$(printf '%s\n' "$eth_info" | awk -F': ' '/status:/ {print $2; exit}')
+    if [ "$eth_active" = "active" ]; then
+        case "$eth_media" in
+            *10000baseT*|*10Gbase*) eth_speed="10 Gbps connected" ;;
+            *5000baseT*) eth_speed="5 Gbps connected" ;;
+            *2500baseT*) eth_speed="2.5 Gbps connected" ;;
+            *1000baseT*) eth_speed="1 Gbps connected" ;;
+            *100base*) eth_speed="100 Mbps connected" ;;
+            *10base*) eth_speed="10 Mbps connected" ;;
+            *) eth_speed="Connected (speed not reported)" ;;
+        esac
+    else
+        eth_speed="Disconnected"
+    fi
+    if [ -n "$ETHERNET_STATUS" ]; then ETHERNET_STATUS="${ETHERNET_STATUS}; "; fi
+    ETHERNET_STATUS="${ETHERNET_STATUS}${eth_port}: ${eth_speed}"
+done < <(networksetup -listallhardwareports 2>/dev/null | awk -F': ' '
+    /^Hardware Port:/ { port=$2 }
+    /^Device:/ {
+        if (port ~ /Ethernet/) print port "|" $2
+    }
+')
+if [ -z "$ETHERNET_STATUS" ]; then ETHERNET_STATUS="Not detected"; fi
+
+FINGERPRINT_STATUS="Not detected"
+if command -v bioutil >/dev/null 2>&1; then
+    BIOUTIL_STATUS=$(bioutil -r 2>/dev/null)
+    if printf '%s\n' "$BIOUTIL_STATUS" | grep -Eq "Touch ID functionality:[[:space:]]*1|Touch ID.*[Ee]nabled"; then
+        FINGERPRINT_STATUS="Touch ID detected"
+    elif printf '%s\n' "$BIOUTIL_STATUS" | grep -Eq "Touch ID functionality:[[:space:]]*0"; then
+        FINGERPRINT_STATUS="Touch ID available but disabled"
+    fi
+fi
+
+OPTICAL_DRIVE_STATUS="Not detected"
+if command -v drutil >/dev/null 2>&1; then
+    OPTICAL_DEVICE=$(drutil list 2>/dev/null | awk '/^[ \t]*[0-9]+[ \t]+/ {$1=""; sub(/^[ \t]+/, ""); print; exit}')
+    if [ -n "$OPTICAL_DEVICE" ]; then OPTICAL_DRIVE_STATUS="Detected (${OPTICAL_DEVICE})"; fi
+fi
+
+KEYBOARD_BACKLIGHT_STATUS="Unknown (not exposed by standard macOS hardware data)"
+if ioreg -l 2>/dev/null | grep -qi "KeyboardBacklight"; then
+    KEYBOARD_BACKLIGHT_STATUS="Detected"
+fi
+
+DIRECTORY_BINDING_STATUS="Not joined"
+if command -v dsconfigad >/dev/null 2>&1; then
+    if dsconfigad -show 2>/dev/null | grep -q "Active Directory Domain"; then
+        DIRECTORY_BINDING_STATUS="Joined"
+    fi
+fi
+
+MDM_STATUS="Not reported"
+if command -v profiles >/dev/null 2>&1; then
+    ENROLLMENT_STATUS=$(profiles status -type enrollment 2>/dev/null)
+    if printf '%s\n' "$ENROLLMENT_STATUS" | grep -Eq "MDM enrollment:[[:space:]]*Yes"; then
+        MDM_STATUS="Enrolled"
+    elif printf '%s\n' "$ENROLLMENT_STATUS" | grep -Eq "MDM enrollment:[[:space:]]*No"; then
+        MDM_STATUS="Not enrolled"
+    else
+        PROFILE_LIST=$(profiles -P 2>/dev/null)
+        if printf '%s\n' "$PROFILE_LIST" | grep -qi "There are no configuration profiles installed"; then
+            MDM_STATUS="No configuration profiles installed"
+        elif printf '%s\n' "$PROFILE_LIST" | grep -Eq "profileIdentifier|Profile Identifier"; then
+            MDM_STATUS="Configuration profiles installed; MDM state unavailable"
+        fi
+    fi
+fi
+
+FIRMWARE_PASSWORD_STATUS="Not reported"
+if command -v firmwarepasswd >/dev/null 2>&1; then
+    FIRMWARE_PASSWORD_OUTPUT=$(firmwarepasswd -check 2>/dev/null)
+    if printf '%s\n' "$FIRMWARE_PASSWORD_OUTPUT" | grep -Eqi "Password Enabled:[[:space:]]*Yes"; then
+        FIRMWARE_PASSWORD_STATUS="Configured"
+    elif printf '%s\n' "$FIRMWARE_PASSWORD_OUTPUT" | grep -Eqi "Password Enabled:[[:space:]]*No"; then
+        FIRMWARE_PASSWORD_STATUS="Not configured"
+    fi
+fi
+
+ABSOLUTE_STATUS="No software agent detected; firmware state not exposed"
+if launchctl list 2>/dev/null | grep -Eqi "absolute|computrace|rpcnet" ||
+   ls /Library/LaunchDaemons/*absolute* /Library/LaunchAgents/*absolute* >/dev/null 2>&1; then
+    ABSOLUTE_STATUS="Software agent detected; firmware state not exposed"
+fi
+
+ACTIVATION_LOCK_STATUS=$(printf '%s\n' "$HARDWARE_PROFILE" | awk -F': ' '/Activation Lock Status:/ {print $2; exit}' | xargs)
+if [ -z "$ACTIVATION_LOCK_STATUS" ]; then
+    ACTIVATION_LOCK_STATUS="Not supported or not reported"
 fi
 
 REPORT_DATE=$(date "+%Y-%m-%d %H:%M:%S")
@@ -313,9 +495,11 @@ td { padding: 8px; border-bottom: 1px solid #eaeaea; }
             <div class="info-grid">
                 <div class="label">Manufacturer</div><div>${MANUFACTURER}</div>
                 <div class="label">Model</div><div>${DISPLAY_MODEL}</div>
+                <div class="label">Form Factor</div><div>${FORM_FACTOR}</div>
                 <div class="label">Serial Number</div><div>${SERIAL}</div>
                 <div class="label">Processor</div><div>${CPU}</div>
                 <div class="label">Installed RAM</div><div>${RAM_GB} GB</div>
+                <div class="label">RAM Slots</div><div>${RAM_SLOTS_STATUS}</div>
                 <div class="label">macOS Version</div><div>${OS_VER} (${OS_BUILD})</div>
                 <div class="label">Computer Name</div><div>${COMP_NAME}</div>
             </div>
@@ -327,12 +511,23 @@ td { padding: 8px; border-bottom: 1px solid #eaeaea; }
                 ${RAM_HTML}
             </table>
         </div>
+        <div class="section">
+            <h2>Connectivity &amp; Features</h2>
+            <div class="info-grid">
+                <div class="label">Wi-Fi Generation</div><div>${WIFI_GENERATION}</div>
+                <div class="label">Ethernet</div><div>${ETHERNET_STATUS}</div>
+                <div class="label">Fingerprint Reader</div><div>${FINGERPRINT_STATUS}</div>
+                <div class="label">Optical Drive</div><div>${OPTICAL_DRIVE_STATUS}</div>
+                <div class="label">Keyboard Backlight</div><div>${KEYBOARD_BACKLIGHT_STATUS}</div>
+            </div>
+        </div>
     </div>
     <div class="column">
         <div class="section">
-            <h2>Display & Graphics</h2>
+            <h2>Display &amp; Graphics</h2>
             <div class="info-grid" style="margin-bottom: 12px;">
                 <div class="label">Resolution</div><div style="font-weight:700;">${RESOLUTION}</div>
+                ${LAPTOP_DISPLAY_HTML}
             </div>
             <table>
                 <tr><th>GPU</th><th>VRAM</th><th>Processor</th><th>Driver</th></tr>
@@ -347,8 +542,25 @@ td { padding: 8px; border-bottom: 1px solid #eaeaea; }
             </table>
         </div>
         <div class="section">
+            <h2>Storage SMART Status</h2>
+            <table>
+                <tr><th>Drive</th><th>SMART</th></tr>
+                ${SMART_HTML}
+            </table>
+        </div>
+        <div class="section">
             <h2>Battery Health</h2>
             ${BATTERY_HTML}
+        </div>
+        <div class="section">
+            <h2>Management &amp; Security</h2>
+            <div class="info-grid">
+                <div class="label">Directory Binding</div><div>${DIRECTORY_BINDING_STATUS}</div>
+                <div class="label">MDM Enrollment</div><div>${MDM_STATUS}</div>
+                <div class="label">Firmware Password</div><div>${FIRMWARE_PASSWORD_STATUS}</div>
+                <div class="label">Absolute / Computrace</div><div>${ABSOLUTE_STATUS}</div>
+                <div class="label">Activation Lock</div><div>${ACTIVATION_LOCK_STATUS}</div>
+            </div>
         </div>
     </div>
 </div>

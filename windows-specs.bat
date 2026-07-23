@@ -22,7 +22,8 @@ $ComputerInfo = Get-CimInstance Win32_ComputerSystem
 $Product      = Get-CimInstance Win32_ComputerSystemProduct
 $BIOS         = Get-CimInstance Win32_BIOS
 $OS           = Get-CimInstance Win32_OperatingSystem
-$GPU          = Get-CimInstance Win32_VideoController
+$GPU          = @(Get-CimInstance Win32_VideoController)
+$Enclosure    = Get-CimInstance Win32_SystemEnclosure | Select-Object -First 1
 
 # ---------- LENOVO FRIENDLY NAME CHECK ----------
 $DisplayModel = $ComputerInfo.Model
@@ -34,6 +35,13 @@ if ($ComputerInfo.Manufacturer -match "Lenovo" -and $DisplayModel.Length -eq 10)
         $DisplayModel = "ThinkCentre M83"
     }
 }
+
+$PortableChassisTypes = @(8, 9, 10, 11, 12, 14, 18, 21, 30, 31, 32)
+$IsLaptop = ($ComputerInfo.PCSystemType -eq 2 -or $ComputerInfo.PCSystemType -eq 8)
+if (-not $IsLaptop -and $Enclosure) {
+    $IsLaptop = @($Enclosure.ChassisTypes | Where-Object { $PortableChassisTypes -contains [int]$_ }).Count -gt 0
+}
+$FormFactorStatus = if ($IsLaptop) { "Laptop / Portable" } elseif ($ComputerInfo.PCSystemType -eq 1) { "Desktop" } else { "Desktop / Other" }
 
 # ---------- CPU INFO ----------
 $RawCPU = Get-CimInstance Win32_Processor | Select-Object -First 1
@@ -52,7 +60,7 @@ else {
 
 
 # ---------- RAM INFO ----------
-$PhysicalMemory = Get-CimInstance Win32_PhysicalMemory
+$PhysicalMemory = @(Get-CimInstance Win32_PhysicalMemory)
 
 $TotalSystemRAMGB = [math]::Round(($PhysicalMemory | Measure-Object -Property Capacity -Sum).Sum / 1GB, 0)
 
@@ -90,9 +98,10 @@ if (Get-Command Get-PhysicalDisk -ErrorAction SilentlyContinue) {
 
 # ---------- DISPLAY INFO ----------
 # Look for the controller that is actually driving a display (has a resolution)
-$Resolution = Get-CimInstance Win32_VideoController | Where-Object { 
-    $_.CurrentHorizontalResolution -ne $null 
-} | Select-Object -First 1
+$ActiveVideoControllers = @(Get-CimInstance Win32_VideoController | Where-Object {
+    $_.CurrentHorizontalResolution -ne $null
+})
+$Resolution = $ActiveVideoControllers | Select-Object -First 1
 
 # Fallback: if both are null, try to get it from the desktop monitor class
 if ($null -eq $Resolution) {
@@ -203,7 +212,7 @@ function Get-RamType($SMBIOSMemoryType) {
 }
 
 function SafeValue($Value) {
-    if ($null -eq $Value -or $Value -eq "") { return "N/A" }
+    if ($null -eq $Value -or [string]::IsNullOrWhiteSpace([string]$Value)) { return "N/A" }
     return $Value
 }
 
@@ -231,6 +240,28 @@ function Normalize-MediaType($Value) {
     $text = ([string]$Value).Trim()
     if ([string]::IsNullOrWhiteSpace($text) -or $text -eq "0" -or $text -eq "Unspecified") { return "Unknown" }
     return $text
+}
+
+function Format-LinkSpeed($BitsPerSecond) {
+    if ($null -eq $BitsPerSecond -or [double]$BitsPerSecond -le 0) { return "Unknown speed" }
+    $speed = [double]$BitsPerSecond
+    if ($speed -ge 1000000000) { return ("{0:0.#} Gbps" -f ($speed / 1000000000)) }
+    if ($speed -ge 1000000) { return ("{0:0} Mbps" -f ($speed / 1000000)) }
+    return ("{0:0} Kbps" -f ($speed / 1000))
+}
+
+function Normalize-Identifier($Value) {
+    if ([string]::IsNullOrWhiteSpace([string]$Value)) { return "" }
+    return ([regex]::Replace([string]$Value, '[^A-Za-z0-9]', '')).ToUpperInvariant()
+}
+
+function Get-FirmwareState($Value) {
+    $text = ([string]$Value).Trim()
+    if ([string]::IsNullOrWhiteSpace($text)) { return "Setting present; state unclear" }
+    if ($text -match '(?i)permanent.*disabl') { return "Permanently disabled" }
+    if ($text -match '(?i)deactivat|disabled|disable|not enabled|off') { return "Disabled / Deactivated" }
+    if ($text -match '(?i)activat|enabled|enable|on') { return "Enabled / Activated" }
+    return "Setting present; state unclear"
 }
 
 function Convert-BatteryCapacityToInt($CapacityText) {
@@ -356,6 +387,229 @@ function Get-BatteryRecordsFromReport($BatteryContent) {
     return $records
 }
 
+# ---------- BUYER-FACING HARDWARE & MANAGEMENT CHECKS ----------
+$MemoryArrays = @(Get-CimInstance Win32_PhysicalMemoryArray -ErrorAction SilentlyContinue)
+$SystemMemoryArrays = @($MemoryArrays | Where-Object { $_.Use -eq 3 -and $_.MemoryDevices -gt 0 })
+if ($SystemMemoryArrays.Count -eq 0) {
+    $SystemMemoryArrays = @($MemoryArrays | Where-Object { $_.MemoryDevices -gt 0 })
+}
+$InstalledSlots = @($PhysicalMemory | Where-Object { $_.Capacity -gt 0 }).Count
+$ReportedSlots = ($SystemMemoryArrays | Measure-Object -Property MemoryDevices -Sum).Sum
+$ReportedLocators = @($PhysicalMemory | Where-Object {
+    $_.Capacity -gt 0 -and -not [string]::IsNullOrWhiteSpace([string]$_.DeviceLocator)
+} | Select-Object -ExpandProperty DeviceLocator -Unique).Count
+$RamSlotsStatus = "Unknown (SMBIOS slot count was not reliable)"
+if ($InstalledSlots -gt 0 -and $ReportedSlots -ge $InstalledSlots -and $ReportedLocators -eq $InstalledSlots) {
+    $FreeSlots = [int]$ReportedSlots - $InstalledSlots
+    $RamSlotsStatus = "$InstalledSlots used / $([int]$ReportedSlots) total / $FreeSlots free"
+}
+
+$LaptopDisplayHTML = ""
+if ($IsLaptop) {
+    $BuiltInDisplaySize = "Unknown (internal-panel EDID not reported)"
+    $InternalMonitor = $null
+    try {
+        $ActiveMonitorParams = @(Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorBasicDisplayParams -ErrorAction Stop |
+            Where-Object { $_.Active -and $_.MaxHorizontalImageSize -gt 0 -and $_.MaxVerticalImageSize -gt 0 })
+        $InternalConnections = @(Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorConnectionParams -ErrorAction Stop |
+            Where-Object { [uint32]$_.VideoOutputTechnology -eq [uint32]2147483648 })
+        foreach ($connection in $InternalConnections) {
+            $InternalMonitor = $ActiveMonitorParams |
+                Where-Object { $_.InstanceName -eq $connection.InstanceName } |
+                Select-Object -First 1
+            if ($InternalMonitor) { break }
+        }
+        if ($InternalMonitor) {
+            $diagonalCm = [Math]::Sqrt(
+                ([double]$InternalMonitor.MaxHorizontalImageSize * [double]$InternalMonitor.MaxHorizontalImageSize) +
+                ([double]$InternalMonitor.MaxVerticalImageSize * [double]$InternalMonitor.MaxVerticalImageSize)
+            )
+            $BuiltInDisplaySize = "{0:0.0} inches" -f ($diagonalCm / 2.54)
+        }
+    } catch {}
+
+    $RefreshRates = @($ActiveVideoControllers |
+        Where-Object { $_.CurrentRefreshRate -gt 1 } |
+        Select-Object -ExpandProperty CurrentRefreshRate -Unique)
+    $BuiltInRefreshRate = if ($InternalMonitor -and $ActiveMonitorParams.Count -eq 1 -and $ActiveVideoControllers.Count -eq 1 -and $RefreshRates.Count -eq 1) {
+        "$($RefreshRates[0]) Hz"
+    } else {
+        "Unknown (multiple or unreported active displays)"
+    }
+    $LaptopDisplayHTML = "<div class='label'>Built-in Display Size</div><div>$(HtmlValue $BuiltInDisplaySize)</div><div class='label'>Built-in Refresh Rate</div><div>$(HtmlValue $BuiltInRefreshRate)</div>"
+}
+
+$WifiGeneration = "Not detected"
+$WlanOutput = @(& netsh.exe wlan show drivers 2>$null)
+if ($WlanOutput.Count -gt 0) {
+    $WifiStandards = @([regex]::Matches(($WlanOutput -join " "), '802\.11(?:be|ax|ac|n|g|b|a)', 'IgnoreCase') |
+        ForEach-Object { $_.Value.ToLowerInvariant() } |
+        Select-Object -Unique)
+    if ($WifiStandards -contains "802.11be") {
+        $WifiGeneration = "Wi-Fi 7 (802.11be)"
+    } elseif ($WifiStandards -contains "802.11ax") {
+        $WifiGeneration = "Wi-Fi 6 class (802.11ax)"
+    } elseif ($WifiStandards -contains "802.11ac") {
+        $WifiGeneration = "Wi-Fi 5 (802.11ac)"
+    } elseif ($WifiStandards -contains "802.11n") {
+        $WifiGeneration = "Wi-Fi 4 (802.11n)"
+    } elseif ($WifiStandards.Count -gt 0) {
+        $WifiGeneration = "Legacy Wi-Fi ($($WifiStandards -join ', '))"
+    }
+}
+
+$EthernetSummaries = @()
+$EthernetAdapters = @(Get-CimInstance Win32_NetworkAdapter -ErrorAction SilentlyContinue | Where-Object {
+    $_.PhysicalAdapter -and
+    ($_.AdapterTypeID -eq 0 -or $_.AdapterType -match "Ethernet") -and
+    ("$($_.Name) $($_.Description)" -notmatch "Wireless|Wi-Fi|WiFi|Bluetooth|Virtual|VPN")
+})
+foreach ($adapter in $EthernetAdapters) {
+    $adapterName = if (-not [string]::IsNullOrWhiteSpace([string]$adapter.NetConnectionID)) { $adapter.NetConnectionID } else { $adapter.Name }
+    $speedText = Format-LinkSpeed $adapter.Speed
+    if ($adapter.NetConnectionStatus -eq 2) {
+        $EthernetSummaries += "$($adapterName): $speedText connected"
+    } else {
+        $EthernetSummaries += "$($adapterName): disconnected ($speedText)"
+    }
+}
+$EthernetStatus = if ($EthernetSummaries.Count -gt 0) { $EthernetSummaries -join "; " } else { "Not detected" }
+
+$PnPDevices = @(Get-CimInstance Win32_PnPEntity -ErrorAction SilentlyContinue)
+$FingerprintDevices = @($PnPDevices | Where-Object {
+    $_.Status -eq "OK" -and ($_.PNPClass -match "Biometric" -or $_.Name -match "fingerprint|biometric")
+} | Select-Object -ExpandProperty Name -Unique)
+$FingerprintStatus = if ($FingerprintDevices.Count -gt 0) { "Detected ($($FingerprintDevices -join ', '))" } else { "Not detected" }
+
+$OpticalDevices = @(Get-CimInstance Win32_CDROMDrive -ErrorAction SilentlyContinue | Where-Object {
+    $_.PNPDeviceID -notmatch "^ROOT\\" -and $_.Name -notmatch "Virtual"
+} | Select-Object -ExpandProperty Name -Unique)
+$OpticalDriveStatus = if ($OpticalDevices.Count -gt 0) { "Detected ($($OpticalDevices -join ', '))" } else { "Not detected" }
+
+$BacklitKeyboardDevices = @($PnPDevices | Where-Object {
+    $_.Status -eq "OK" -and $_.Name -match "backlit keyboard|keyboard backlight|illuminated keyboard"
+} | Select-Object -ExpandProperty Name -Unique)
+$KeyboardBacklightStatus = if ($BacklitKeyboardDevices.Count -gt 0) {
+    "Detected ($($BacklitKeyboardDevices -join ', '))"
+} else {
+    "Unknown (not exposed by standard Windows hardware data)"
+}
+
+$DomainJoinStatus = if ($ComputerInfo.PartOfDomain) { "Joined" } else { "Not joined" }
+$EntraIdStatus = "Not reported"
+$WorkplaceJoinStatus = "Not reported"
+$DsregPath = "$env:SystemRoot\System32\dsregcmd.exe"
+if (Test-Path $DsregPath) {
+    $DsregOutput = @(& $DsregPath /status 2>$null) -join "`n"
+    if (-not [string]::IsNullOrWhiteSpace($DsregOutput)) {
+        $EntraIdStatus = if ($DsregOutput -match '(?im)^\s*AzureAdJoined\s*:\s*YES\s*$') { "Joined" } else { "Not joined" }
+        $WorkplaceJoinStatus = if ($DsregOutput -match '(?im)^\s*WorkplaceJoined\s*:\s*YES\s*$') { "Joined" } else { "Not joined" }
+    }
+}
+
+$MdmEnrollmentStatus = "Not detected"
+try {
+    $EnrollmentKeys = @(Get-ChildItem "HKLM:\SOFTWARE\Microsoft\Enrollments" -ErrorAction Stop)
+    foreach ($key in $EnrollmentKeys) {
+        $properties = Get-ItemProperty $key.PSPath -ErrorAction SilentlyContinue
+        if ($properties -and (
+            -not [string]::IsNullOrWhiteSpace([string]$properties.ProviderID) -or
+            -not [string]::IsNullOrWhiteSpace([string]$properties.DiscoveryServiceFullURL)
+        )) {
+            $MdmEnrollmentStatus = "Enrollment detected"
+            break
+        }
+    }
+} catch {
+    $MdmEnrollmentStatus = "Unknown (registry status unavailable)"
+}
+
+$BiosPasswordStatus = "Not exposed by firmware"
+$AbsoluteFirmwareStatus = ""
+$DellBiosAttributes = @()
+$LenovoBiosSettings = @()
+$HpBiosSettings = @()
+if ($ComputerInfo.Manufacturer -match "Dell") {
+    try {
+        $DellBiosAttributes = @(Get-CimInstance -Namespace "root\dcim\sysman\biosattributes" -ClassName EnumerationAttribute -ErrorAction Stop)
+        $passwordAttribute = $DellBiosAttributes |
+            Where-Object { $_.AttributeName -match "Admin.*Password|AdminPwd|Setup.*Password" } |
+            Select-Object -First 1
+        if ($passwordAttribute) {
+            if ($passwordAttribute.CurrentValue -match '(?i)^not set$|disabled|none') {
+                $BiosPasswordStatus = "Not configured"
+            } elseif ($passwordAttribute.CurrentValue -match '(?i)set|enabled') {
+                $BiosPasswordStatus = "Configured"
+            } else {
+                $BiosPasswordStatus = "Firmware setting present; state unclear"
+            }
+        }
+    } catch {}
+} elseif ($ComputerInfo.Manufacturer -match "Lenovo") {
+    try {
+        $passwordSettings = Get-CimInstance -Namespace "root\wmi" -ClassName Lenovo_BiosPasswordSettings -ErrorAction Stop |
+            Select-Object -First 1
+        if ($passwordSettings -and $null -ne $passwordSettings.PasswordState) {
+            $BiosPasswordStatus = if ([int]$passwordSettings.PasswordState -eq 0) { "Not configured" } else { "Configured" }
+        }
+    } catch {}
+    try {
+        $LenovoBiosSettings = @(Get-CimInstance -Namespace "root\wmi" -ClassName Lenovo_BiosSetting -ErrorAction SilentlyContinue)
+    } catch {}
+} elseif ($ComputerInfo.Manufacturer -match "HP|Hewlett") {
+    try {
+        $HpBiosSettings = @(Get-CimInstance -Namespace "root\HP\InstrumentedBIOS" -ClassName HP_BIOSSetting -ErrorAction Stop)
+        $passwordSetting = $HpBiosSettings |
+            Where-Object { $_.Name -match "Setup Password|Administrator Password" } |
+            Select-Object -First 1
+        if ($passwordSetting -and $null -ne $passwordSetting.IsSet) {
+            $BiosPasswordStatus = if ([int]$passwordSetting.IsSet -gt 0) { "Configured" } else { "Not configured" }
+        } elseif ($passwordSetting) {
+            $BiosPasswordStatus = "Firmware setting present; state unclear"
+        }
+    } catch {}
+}
+
+if ($DellBiosAttributes.Count -gt 0) {
+    $absoluteSetting = $DellBiosAttributes |
+        Where-Object { $_.AttributeName -match "Absolute|Computrace" } |
+        Select-Object -First 1
+    if ($absoluteSetting) { $AbsoluteFirmwareStatus = Get-FirmwareState $absoluteSetting.CurrentValue }
+} elseif ($LenovoBiosSettings.Count -gt 0) {
+    $absoluteSetting = $LenovoBiosSettings |
+        Where-Object { $_.CurrentSetting -match "Absolute|Computrace" } |
+        Select-Object -First 1
+    if ($absoluteSetting) {
+        $AbsoluteFirmwareStatus = Get-FirmwareState (($absoluteSetting.CurrentSetting -split ",", 2)[1])
+    }
+} elseif ($HpBiosSettings.Count -gt 0) {
+    $absoluteSetting = $HpBiosSettings |
+        Where-Object { $_.Name -match "Absolute|Computrace" } |
+        Select-Object -First 1
+    if ($absoluteSetting) {
+        $settingValue = if ($null -ne $absoluteSetting.CurrentValue) { $absoluteSetting.CurrentValue } else { $absoluteSetting.Value }
+        $AbsoluteFirmwareStatus = Get-FirmwareState $settingValue
+    }
+}
+
+$AbsoluteAgent = Get-CimInstance Win32_Service -ErrorAction SilentlyContinue |
+    Where-Object { "$($_.Name) $($_.DisplayName)" -match "(?i)rpcnet|computrace|absolute persistence|absolute agent" } |
+    Select-Object -First 1
+if (-not [string]::IsNullOrWhiteSpace($AbsoluteFirmwareStatus) -and $AbsoluteAgent) {
+    $AbsoluteStatus = "$AbsoluteFirmwareStatus; software agent detected"
+} elseif (-not [string]::IsNullOrWhiteSpace($AbsoluteFirmwareStatus)) {
+    $AbsoluteStatus = "$AbsoluteFirmwareStatus; no software agent detected"
+} elseif ($AbsoluteAgent) {
+    $AbsoluteStatus = "Software agent detected; firmware state not exposed"
+} else {
+    $AbsoluteStatus = "Not exposed; no software agent detected"
+}
+
+$SmartPredictions = @()
+try {
+    $SmartPredictions = @(Get-CimInstance -Namespace root\wmi -ClassName MSStorageDriver_FailurePredictStatus -ErrorAction Stop)
+} catch {}
+
 # ---------- RAM SECTION ----------
 $RamHTML = ""
 $TotalModuleGB = 0
@@ -389,24 +643,53 @@ foreach ($disk in $DiskDrives) {
     $bus = if ($storageDisk -and -not [string]::IsNullOrWhiteSpace([string]$storageDisk.BusType) -and ([string]$storageDisk.BusType -ne "Unknown")) { $storageDisk.BusType } else { $disk.InterfaceType }
     $media = if ($storageDisk) { Normalize-MediaType $storageDisk.MediaType } else { "Unknown" }
 
-    if ($media -eq "Unknown" -and $PhysDisks) {
+    $match = $null
+    if ($PhysDisks) {
         $diskSerial = ([string]$disk.SerialNumber).Trim()
-        $match = $null
         if (-not [string]::IsNullOrWhiteSpace($diskSerial)) {
             $match = $PhysDisks | Where-Object { ([string]$_.SerialNumber).Trim() -eq $diskSerial } | Select-Object -First 1
         }
         if (-not $match) {
             $match = $PhysDisks | Where-Object { $_.DeviceId -eq $disk.Index } | Select-Object -First 1
         }
-        if ($match) { $media = Normalize-MediaType $match.MediaType }
+        if (-not $match) {
+            $match = $PhysDisks | Where-Object {
+                -not [string]::IsNullOrWhiteSpace([string]$model) -and
+                -not [string]::IsNullOrWhiteSpace([string]$_.FriendlyName) -and
+                ([string]$model -like "*$($_.FriendlyName)*" -or [string]$_.FriendlyName -like "*$model*")
+            } | Select-Object -First 1
+        }
+    }
+    if ($media -eq "Unknown" -and $match) {
+        $media = Normalize-MediaType $match.MediaType
     }
 
-    $DiskHTML += "<tr><td>Disk $(HtmlValue $disk.Index)</td><td>$(HtmlValue $model)</td><td>$(HtmlValue $size)</td><td>$(HtmlValue $media)</td><td>$(HtmlValue $bus)</td></tr>"
+    $health = "Unknown"
+    if ($match -and -not [string]::IsNullOrWhiteSpace([string]$match.HealthStatus)) {
+        $health = [string]$match.HealthStatus
+    }
+    if (($health -eq "Unknown" -or [string]::IsNullOrWhiteSpace($health)) -and $SmartPredictions.Count -gt 0) {
+        $diskIdentifier = Normalize-Identifier $disk.PNPDeviceID
+        if ($diskIdentifier.Length -gt 8) {
+            $prediction = $SmartPredictions | Where-Object {
+                $predictionIdentifier = Normalize-Identifier $_.InstanceName
+                $predictionIdentifier.Length -gt 8 -and (
+                    $predictionIdentifier.Contains($diskIdentifier) -or
+                    $diskIdentifier.Contains($predictionIdentifier)
+                )
+            } | Select-Object -First 1
+            if ($prediction) {
+                $health = if ($prediction.PredictFailure) { "Warning (predictive failure)" } else { "OK" }
+            }
+        }
+    }
+
+    $DiskHTML += "<tr><td>Disk $(HtmlValue $disk.Index)</td><td>$(HtmlValue $model)</td><td>$(HtmlValue $size)</td><td>$(HtmlValue $media)</td><td>$(HtmlValue $bus)</td><td>$(HtmlValue $health)</td></tr>"
 }
 if ($DiskDrives.Count -gt 0) {
-    $DiskHTML += "<tr><td colspan='5' style='text-align:left; padding-left:40px; font-weight:bold;'>Total Drives: $($DiskDrives.Count)</td></tr>"
+    $DiskHTML += "<tr><td colspan='6' style='text-align:left; padding-left:40px; font-weight:bold;'>Total Drives: $($DiskDrives.Count)</td></tr>"
 } else {
-    $DiskHTML = "<tr><td colspan='5'>No internal storage drives detected</td></tr>"
+    $DiskHTML = "<tr><td colspan='6'>No internal storage drives detected</td></tr>"
 }
 
 # ---------- GPU SECTION ----------
@@ -449,7 +732,7 @@ foreach ($g in $GPU) {
 
 # ---------- BATTERY SECTION ----------
 $BatteryHTML = "<p style='font-size: var(--font-small); margin: var(--pad-sm) 0;'>No Battery Detected</p>"
-if ($ComputerInfo.PCSystemType -eq 2) {
+if ($IsLaptop) {
     $BatteryPath = "$env:TEMP\battery-report.html"
     powercfg /batteryreport /output $BatteryPath > $null 2>&1
     if (Test-Path $BatteryPath) {
@@ -562,9 +845,9 @@ $HTML = @"
 html, body {
     margin: 0;
     padding: 0;
-    width: 100vw;
-    height: 100vh;
-    overflow: hidden; /* Force no scrolling */
+    width: 100%;
+    min-height: 100%;
+    overflow: auto;
     font-family: "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
     background: var(--bg-color);
     color: var(--text-main);
@@ -572,8 +855,6 @@ html, body {
 
 body {
     padding: var(--pad-lg);
-    display: flex;
-    flex-direction: column;
 }
 
 .header-container {
@@ -622,7 +903,7 @@ h1 {
 .container {
     display: flex;
     gap: var(--gap-size);
-    flex: 1;
+    align-items: flex-start;
 }
 
 .column {
@@ -712,9 +993,11 @@ tr:last-child td {
             <div class="info-grid">
                 <div class="label">Manufacturer</div><div>$($ComputerInfo.Manufacturer)</div>
                 <div class="label">Model</div><div>$DisplayModel</div>
+                <div class="label">Form Factor</div><div>$(HtmlValue $FormFactorStatus)</div>
                 <div class="label">Serial Number</div><div>$($BIOS.SerialNumber)</div>
                 <div class="label">Processor</div><div>$CPU_Display</div>
                 <div class="label">Installed RAM</div><div>$TotalSystemRAMGB GB</div>
+                <div class="label">RAM Slots</div><div>$(HtmlValue $RamSlotsStatus)</div>
                 <div class="label">Windows Version</div><div>$($OS.Caption)</div>
                 <div class="label">Build Number</div><div>$($OS.BuildNumber)</div>
                 <div class="label">Windows Activation</div><div>$(HtmlValue $WindowsActivationStatus)</div>
@@ -731,15 +1014,27 @@ tr:last-child td {
                 $RamHTML
             </table>
         </div>
-       
+
+        <div class="section">
+            <h2>Connectivity &amp; Features</h2>
+            <div class="info-grid">
+                <div class="label">Wi-Fi Generation</div><div>$(HtmlValue $WifiGeneration)</div>
+                <div class="label">Ethernet</div><div>$(HtmlValue $EthernetStatus)</div>
+                <div class="label">Fingerprint Reader</div><div>$(HtmlValue $FingerprintStatus)</div>
+                <div class="label">Optical Drive</div><div>$(HtmlValue $OpticalDriveStatus)</div>
+                <div class="label">Keyboard Backlight</div><div>$(HtmlValue $KeyboardBacklightStatus)</div>
+            </div>
+        </div>
+
     </div>
 
     <div class="column">
         <div class="section">
-            <h2>Display & Graphics</h2>
+            <h2>Display &amp; Graphics</h2>
             <div class="info-grid" style="margin-bottom: var(--pad-md);">
                 <div class="label" style="color: var(--brand-blue); font-size: var(--font-h2); font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px;">Resolution</div>
                 <div style="font-size: var(--font-h2); font-weight: 700; color: var(--text-main);">$ResWidth x $ResHeight</div>
+                $LaptopDisplayHTML
             </div>
             <table>
                 <tr>
@@ -754,7 +1049,7 @@ tr:last-child td {
         <div class="section">
             <h2>Storage Drives</h2>
             <table>
-                <tr><th>#</th><th>Model</th><th>Size</th><th>Type</th><th>Bus</th></tr>
+                <tr><th>#</th><th>Model</th><th>Size</th><th>Type</th><th>Bus</th><th>Health</th></tr>
                 $DiskHTML
             </table>
         </div>
@@ -762,6 +1057,18 @@ tr:last-child td {
         <div class="section">
             <h2>Battery Health</h2>
             $BatteryHTML
+        </div>
+
+        <div class="section">
+            <h2>Management &amp; Security</h2>
+            <div class="info-grid">
+                <div class="label">Windows Domain</div><div>$(HtmlValue $DomainJoinStatus)</div>
+                <div class="label">Entra ID</div><div>$(HtmlValue $EntraIdStatus)</div>
+                <div class="label">Workplace Join</div><div>$(HtmlValue $WorkplaceJoinStatus)</div>
+                <div class="label">MDM Enrollment</div><div>$(HtmlValue $MdmEnrollmentStatus)</div>
+                <div class="label">BIOS Password</div><div>$(HtmlValue $BiosPasswordStatus)</div>
+                <div class="label">Absolute / Computrace</div><div>$(HtmlValue $AbsoluteStatus)</div>
+            </div>
         </div>
 
     </div>

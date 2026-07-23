@@ -4,8 +4,14 @@ Small Windows and macOS scripts for generating a local HTML system specification
 
 ## Files
 
-- `windows-specs.bat` generates a Windows system specification report, including touchscreen capability and Windows activation status.
-- `mac-specs.command` generates a macOS system specification report using Lion-compatible Bash, storage detection, and HTML/CSS.
+- `windows-specs.bat` generates a Windows system specification report, including touchscreen capability, activation status, connectivity, basic storage health, and available management-state checks.
+- `mac-specs.command` generates a macOS system specification report using Lion-compatible Bash, storage detection, connectivity checks, basic SMART status, and available management-state checks.
+
+## Buyer-Facing Checks
+
+Where the operating system exposes trustworthy data, reports include RAM slots used/free, Wi-Fi generation, Ethernet link state/speed, fingerprint and optical-drive detection, keyboard-backlight detection, basic storage health, and laptop-only built-in display size/refresh rate.
+
+Management checks report only status, never credentials or bypass codes. Depending on platform and manufacturer, these can include domain or directory binding, MDM enrollment, BIOS or firmware password state, Absolute/Computrace state, and Mac Activation Lock state. Unsupported or ambiguous checks are labeled `Unknown`, `Not reported`, or `Not exposed` instead of being presented as negative results.
 
 ## Privacy Note
 
