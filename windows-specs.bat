@@ -6,7 +6,21 @@ echo GENERATING SYSTEM SPECIFICATION REPORT
 echo Please wait, this may take a moment...
 echo ======================================
 
+ver | findstr /C:"5.1." /C:"5.2." >nul
+if not errorlevel 1 goto xp_report
+
 powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "iex ((Get-Content -LiteralPath '%~f0') -join \"`n\")"
+exit /b
+
+:xp_report
+if not exist "%~dp0windows-specs-xp.vbs" (
+    echo.
+    echo ERROR: windows-specs-xp.vbs must be in the same folder as this file.
+    pause
+    exit /b 1
+)
+cscript.exe //nologo "%~dp0windows-specs-xp.vbs"
+if errorlevel 1 pause
 exit /b
 #>
 

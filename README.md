@@ -5,6 +5,7 @@ Small Windows and macOS scripts for generating a local HTML system specification
 ## Files
 
 - `windows-specs.bat` generates a Windows system specification report, including touchscreen capability, activation status, connectivity, basic storage health, and available management-state checks.
+- `windows-specs-xp.vbs` is the Windows XP compatibility reporter automatically launched by `windows-specs.bat` on XP. Keep both Windows files in the same folder.
 - `mac-specs.command` generates a macOS system specification report using Lion-compatible Bash, storage detection, connectivity checks, basic SMART status, and available management-state checks.
 
 ## Buyer-Facing Checks
@@ -22,6 +23,8 @@ Generated reports may include device identifiers such as serial numbers, compute
 ### Windows
 
 Double-click `windows-specs.bat`. The report will be saved to the current user's Desktop and opened automatically.
+
+On Windows XP, the batch launcher automatically uses the companion `windows-specs-xp.vbs` reporter because PowerShell is not included with XP. The compatibility report uses XP-native WMI and Windows Script Host. Checks unavailable on XP are labeled as unsupported or unknown.
 
 ### macOS
 
