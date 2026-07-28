@@ -142,10 +142,11 @@ if ($activeCandidates.Count -gt 0) {
     Write-Host "result stronger than a registry-key-only match, but it is not server-side"
     Write-Host "confirmation that the device is still present in the MDM console."
 } elseif ($registryCandidates.Count -gt 0) {
-    Write-Host "VERDICT: Registry artifacts only; active MDM is NOT confirmed."
+    Write-Host "VERDICT: Registry artifacts only; suppress from the buyer-facing report."
     Write-Host "WHY: Enrollment-looking keys exist, but no matching OMADM account or"
-    Write-Host "EnterpriseMgmt scheduled tasks were found. The keys may be stale remnants"
-    Write-Host "of an old enrollment, provisioning attempt, or unenrollment."
+    Write-Host "EnterpriseMgmt scheduled tasks were found. This pattern is consistent with"
+    Write-Host "stale golden-image, provisioning, or unenrollment remnants and is not"
+    Write-Host "evidence that this device is currently managed."
 } else {
     Write-Host "VERDICT: No MDM enrollment evidence detected by these checks."
 }

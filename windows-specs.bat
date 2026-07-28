@@ -529,9 +529,10 @@ if (Test-Path $DsregPath) {
 }
 
 $MdmEnrollmentStatus = "Not detected"
-$MdmEnrollmentEvidence = "No qualifying enrollment keys found"
+$MdmEnrollmentEvidence = ""
 $MdmRegistryCandidates = @()
 $MdmActiveCandidates = @()
+$MdmCheckCompleted = $false
 try {
     $EnrollmentKeys = @(Get-ChildItem "HKLM:\SOFTWARE\Microsoft\Enrollments" -ErrorAction Stop)
     foreach ($key in $EnrollmentKeys) {
@@ -581,6 +582,7 @@ try {
         }
     }
 
+    $MdmCheckCompleted = $true
     if ($MdmActiveCandidates.Count -gt 0) {
         $activeProviders = @($MdmActiveCandidates | Select-Object -ExpandProperty Provider -Unique)
         $MdmEnrollmentStatus = "Correlated enrollment artifacts detected ($($activeProviders -join ', '))"
@@ -589,15 +591,24 @@ try {
             $MdmEnrollmentEvidence += "; plus $($MdmActiveCandidates.Count - 1) additional matching enrollment(s)"
         }
     } elseif ($MdmRegistryCandidates.Count -gt 0) {
-        $MdmEnrollmentStatus = "Registry artifacts only (possibly stale; not proof of active MDM)"
-        $MdmEnrollmentEvidence = [string]($MdmRegistryCandidates | Select-Object -First 1 -ExpandProperty Evidence)
-        if ($MdmRegistryCandidates.Count -gt 1) {
-            $MdmEnrollmentEvidence += "; plus $($MdmRegistryCandidates.Count - 1) additional registry-only artifact(s)"
-        }
+        # Registry-only entries commonly survive imaging, provisioning, or unenrollment.
+        # They do not prove current management, so keep them out of buyer-facing output.
+        $MdmEnrollmentStatus = "Not detected"
+        $MdmEnrollmentEvidence = ""
     }
 } catch {
-    $MdmEnrollmentStatus = "Unknown (enrollment registry unavailable)"
-    $MdmEnrollmentEvidence = $_.Exception.Message
+    # Do not expose a local inspection error as an alarming enrollment result.
+    # The standalone MDM diagnostic script retains the technician-facing detail.
+    $MdmEnrollmentStatus = ""
+    $MdmEnrollmentEvidence = ""
+}
+
+$MdmReportHTML = ""
+if ($MdmActiveCandidates.Count -gt 0) {
+    $MdmReportHTML = "<div class='label'>MDM Enrollment</div><div>$(HtmlValue $MdmEnrollmentStatus)</div>"
+    $MdmReportHTML += "<div class='label'>MDM Trigger</div><div>$(HtmlValue $MdmEnrollmentEvidence)</div>"
+} elseif ($MdmCheckCompleted) {
+    $MdmReportHTML = "<div class='label'>MDM Enrollment</div><div>Not detected</div>"
 }
 
 $BiosPasswordStatus = "Not exposed by $($ComputerInfo.Manufacturer) firmware; manual BIOS check required"
@@ -1163,8 +1174,7 @@ tr:last-child td {
                 <div class="label">Windows Domain</div><div>$(HtmlValue $DomainJoinStatus)</div>
                 <div class="label">Entra ID</div><div>$(HtmlValue $EntraIdStatus)</div>
                 <div class="label">Workplace Join</div><div>$(HtmlValue $WorkplaceJoinStatus)</div>
-                <div class="label">MDM Enrollment</div><div>$(HtmlValue $MdmEnrollmentStatus)</div>
-                <div class="label">MDM Trigger</div><div>$(HtmlValue $MdmEnrollmentEvidence)</div>
+                $MdmReportHTML
                 <div class="label">BIOS Password</div><div>$(HtmlValue $BiosPasswordStatus)</div>
                 <div class="label">Absolute / Computrace</div><div>$(HtmlValue $AbsoluteStatus)</div>
             </div>
