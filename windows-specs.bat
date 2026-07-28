@@ -412,7 +412,11 @@ $ReportedSlots = ($SystemMemoryArrays | Measure-Object -Property MemoryDevices -
 $ReportedLocators = @($PhysicalMemory | Where-Object {
     $_.Capacity -gt 0 -and -not [string]::IsNullOrWhiteSpace([string]$_.DeviceLocator)
 } | Select-Object -ExpandProperty DeviceLocator -Unique).Count
-$RamSlotsStatus = "Unknown (SMBIOS slot count was not reliable)"
+$RamSlotsStatus = if ($InstalledSlots -gt 0) {
+    "$InstalledSlots populated / total slots unavailable (SMBIOS unreliable)"
+} else {
+    "Unknown (SMBIOS did not report populated or total slots reliably)"
+}
 if ($InstalledSlots -gt 0 -and $ReportedSlots -ge $InstalledSlots -and $ReportedLocators -eq $InstalledSlots) {
     $FreeSlots = [int]$ReportedSlots - $InstalledSlots
     $RamSlotsStatus = "$InstalledSlots used / $([int]$ReportedSlots) total / $FreeSlots free"
@@ -491,7 +495,10 @@ $EthernetStatus = if ($EthernetSummaries.Count -gt 0) { $EthernetSummaries -join
 
 $PnPDevices = @(Get-CimInstance Win32_PnPEntity -ErrorAction SilentlyContinue)
 $FingerprintDevices = @($PnPDevices | Where-Object {
-    $_.Status -eq "OK" -and ($_.PNPClass -match "Biometric" -or $_.Name -match "fingerprint|biometric")
+    $_.Status -eq "OK" -and (
+        $_.Name -match "fingerprint" -or
+        ($_.PNPClass -match "Biometric" -and $_.Name -notmatch "facial|face|camera|Windows Hello Software Device")
+    )
 } | Select-Object -ExpandProperty Name -Unique)
 $FingerprintStatus = if ($FingerprintDevices.Count -gt 0) { "Detected ($($FingerprintDevices -join ', '))" } else { "Not detected" }
 
@@ -522,23 +529,89 @@ if (Test-Path $DsregPath) {
 }
 
 $MdmEnrollmentStatus = "Not detected"
+$MdmEnrollmentEvidence = ""
+$MdmRegistryCandidates = @()
+$MdmActiveCandidates = @()
+$MdmCheckCompleted = $false
 try {
     $EnrollmentKeys = @(Get-ChildItem "HKLM:\SOFTWARE\Microsoft\Enrollments" -ErrorAction Stop)
     foreach ($key in $EnrollmentKeys) {
+        $enrollmentId = [string]$key.PSChildName
+        if ($enrollmentId -notmatch '^\{?[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\}?$') {
+            continue
+        }
+
         $properties = Get-ItemProperty $key.PSPath -ErrorAction SilentlyContinue
-        if ($properties -and (
-            -not [string]::IsNullOrWhiteSpace([string]$properties.ProviderID) -or
-            -not [string]::IsNullOrWhiteSpace([string]$properties.DiscoveryServiceFullURL)
-        )) {
-            $MdmEnrollmentStatus = "Enrollment detected"
-            break
+        if (-not $properties) { continue }
+
+        $providerId = [string]$properties.ProviderID
+        $discoveryUrl = [string]$properties.DiscoveryServiceFullURL
+        $triggerFields = @()
+        if (-not [string]::IsNullOrWhiteSpace($providerId)) { $triggerFields += "ProviderID" }
+        if (-not [string]::IsNullOrWhiteSpace($discoveryUrl)) { $triggerFields += "DiscoveryServiceFullURL" }
+        if ($null -ne $properties.EnrollmentState) { $triggerFields += "EnrollmentState" }
+        $hasEnrollmentMarker = (
+            -not [string]::IsNullOrWhiteSpace($providerId) -or
+            -not [string]::IsNullOrWhiteSpace($discoveryUrl) -or
+            $null -ne $properties.EnrollmentState
+        )
+        if (-not $hasEnrollmentMarker) { continue }
+
+        $omadmPath = "HKLM:\SOFTWARE\Microsoft\Provisioning\OMADM\Accounts\$enrollmentId"
+        $hasOmadmAccount = Test-Path $omadmPath
+        $enterpriseTaskCount = 0
+        if (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue) {
+            try {
+                $taskPath = "\Microsoft\Windows\EnterpriseMgmt\$enrollmentId\"
+                $enterpriseTaskCount = @(Get-ScheduledTask -TaskPath $taskPath -ErrorAction Stop).Count
+            } catch {}
+        }
+
+        $providerText = if (-not [string]::IsNullOrWhiteSpace($providerId)) { $providerId } else { "provider not named" }
+        $stateText = if ($null -ne $properties.EnrollmentState) { [string]$properties.EnrollmentState } else { "not reported" }
+        $evidenceText = "Triggered by $($triggerFields -join '+'); Key $enrollmentId; ProviderID=$providerText; EnrollmentState=$stateText; OMADM account=$hasOmadmAccount; EnterpriseMgmt tasks=$enterpriseTaskCount"
+        $candidate = [pscustomobject]@{
+            EnrollmentId = $enrollmentId
+            Provider = $providerText
+            Evidence = $evidenceText
+            HasActiveCompanion = ($hasOmadmAccount -or $enterpriseTaskCount -gt 0)
+        }
+        $MdmRegistryCandidates += $candidate
+        if ($candidate.HasActiveCompanion) {
+            $MdmActiveCandidates += $candidate
         }
     }
+
+    $MdmCheckCompleted = $true
+    if ($MdmActiveCandidates.Count -gt 0) {
+        $activeProviders = @($MdmActiveCandidates | Select-Object -ExpandProperty Provider -Unique)
+        $MdmEnrollmentStatus = "Correlated enrollment artifacts detected ($($activeProviders -join ', '))"
+        $MdmEnrollmentEvidence = [string]($MdmActiveCandidates | Select-Object -First 1 -ExpandProperty Evidence)
+        if ($MdmActiveCandidates.Count -gt 1) {
+            $MdmEnrollmentEvidence += "; plus $($MdmActiveCandidates.Count - 1) additional matching enrollment(s)"
+        }
+    } elseif ($MdmRegistryCandidates.Count -gt 0) {
+        # Registry-only entries commonly survive imaging, provisioning, or unenrollment.
+        # They do not prove current management, so keep them out of buyer-facing output.
+        $MdmEnrollmentStatus = "Not detected"
+        $MdmEnrollmentEvidence = ""
+    }
 } catch {
-    $MdmEnrollmentStatus = "Unknown (registry status unavailable)"
+    # Do not expose a local inspection error as an alarming enrollment result.
+    # The standalone MDM diagnostic script retains the technician-facing detail.
+    $MdmEnrollmentStatus = ""
+    $MdmEnrollmentEvidence = ""
 }
 
-$BiosPasswordStatus = "Not exposed by firmware"
+$MdmReportHTML = ""
+if ($MdmActiveCandidates.Count -gt 0) {
+    $MdmReportHTML = "<div class='label'>MDM Enrollment</div><div>$(HtmlValue $MdmEnrollmentStatus)</div>"
+    $MdmReportHTML += "<div class='label'>MDM Trigger</div><div>$(HtmlValue $MdmEnrollmentEvidence)</div>"
+} elseif ($MdmCheckCompleted) {
+    $MdmReportHTML = "<div class='label'>MDM Enrollment</div><div>Not detected</div>"
+}
+
+$BiosPasswordStatus = "Not exposed by $($ComputerInfo.Manufacturer) firmware; manual BIOS check required"
 $AbsoluteFirmwareStatus = ""
 $DellBiosAttributes = @()
 $LenovoBiosSettings = @()
@@ -825,6 +898,7 @@ $HTML = @"
 <!DOCTYPE html>
 <html>
 <head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>System Report - $($BIOS.SerialNumber)</title>
 <style>
 :root {
@@ -841,17 +915,17 @@ $HTML = @"
     /* clamp(min-size, preferred-viewport-scaling, max-size) */
     
     /* Typography */
-    --font-base: clamp(11px, 1.8vh, 16px);
-    --font-small: clamp(10px, 1.5vh, 14px);
-    --font-h1: clamp(18px, 3vh, 26px);
-    --font-h2: clamp(13px, 2.2vh, 18px);
-    --font-icon: clamp(14px, 2.5vh, 20px);
+    --font-base: clamp(10px, 1.35vh, 14px);
+    --font-small: clamp(9px, 1.15vh, 12px);
+    --font-h1: clamp(16px, 2.2vh, 23px);
+    --font-h2: clamp(11px, 1.65vh, 16px);
+    --font-icon: clamp(12px, 1.9vh, 18px);
 
     /* Spacing & Layout */
-    --pad-sm: clamp(3px, 0.8vh, 8px);
-    --pad-md: clamp(6px, 1.5vh, 12px);
-    --pad-lg: clamp(8px, 2vh, 16px);
-    --gap-size: clamp(8px, 2vh, 16px);
+    --pad-sm: clamp(2px, 0.35vh, 5px);
+    --pad-md: clamp(4px, 0.7vh, 8px);
+    --pad-lg: clamp(6px, 1vh, 12px);
+    --gap-size: clamp(6px, 1vh, 12px);
 }
 
 * { box-sizing: border-box; }
@@ -922,6 +996,7 @@ h1 {
 
 .column {
     flex: 1;
+    min-width: 0;
     display: flex;
     flex-direction: column;
     gap: var(--gap-size);
@@ -989,13 +1064,33 @@ tr:last-child td {
     color: #888;
     margin-top: var(--pad-md);
 }
+
+.info-grid > div {
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+@media screen and (max-height: 760px) {
+    :root {
+        --font-base: 9px;
+        --font-small: 8px;
+        --font-h1: 15px;
+        --font-h2: 10px;
+        --pad-sm: 1px;
+        --pad-md: 3px;
+        --pad-lg: 5px;
+        --gap-size: 4px;
+    }
+    .header-container { border-radius: 4px; }
+    .section { border-radius: 4px; }
+}
 </style>
 </head>
 <body>
 
 <div class="header-container">
     <div class="logo-container">
-        <img src="$LogoBase64" alt="Control Alt Recycle" style="max-height: 50px; width: auto;">
+        <img src="$LogoBase64" alt="Control Alt Recycle" style="max-height: clamp(32px, 4.5vh, 42px); width: auto;">
     </div>
     <h1>System Specification Report</h1>
 </div>
@@ -1079,7 +1174,7 @@ tr:last-child td {
                 <div class="label">Windows Domain</div><div>$(HtmlValue $DomainJoinStatus)</div>
                 <div class="label">Entra ID</div><div>$(HtmlValue $EntraIdStatus)</div>
                 <div class="label">Workplace Join</div><div>$(HtmlValue $WorkplaceJoinStatus)</div>
-                <div class="label">MDM Enrollment</div><div>$(HtmlValue $MdmEnrollmentStatus)</div>
+                $MdmReportHTML
                 <div class="label">BIOS Password</div><div>$(HtmlValue $BiosPasswordStatus)</div>
                 <div class="label">Absolute / Computrace</div><div>$(HtmlValue $AbsoluteStatus)</div>
             </div>
