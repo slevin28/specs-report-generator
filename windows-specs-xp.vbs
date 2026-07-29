@@ -125,10 +125,10 @@ End Function
 Function FormatBytes(byteValue)
     If Not IsNumeric(byteValue) Then
         FormatBytes = "Unknown"
-    ElseIf CDbl(byteValue) >= 1000000000000# Then
-        FormatBytes = CStr(Round(CDbl(byteValue) / 1000000000000#, 2)) & " TB"
+    ElseIf CDbl(byteValue) >= 1E+12 Then
+        FormatBytes = CStr(Round(CDbl(byteValue) / 1E+12, 2)) & " TB"
     Else
-        FormatBytes = CStr(Round(CDbl(byteValue) / 1000000000#, 1)) & " GB"
+        FormatBytes = CStr(Round(CDbl(byteValue) / 1E+9, 1)) & " GB"
     End If
 End Function
 
@@ -137,12 +137,12 @@ Function FormatLinkSpeed(bitsPerSecond)
         FormatLinkSpeed = "unknown speed"
     ElseIf CDbl(bitsPerSecond) <= 0 Then
         FormatLinkSpeed = "unknown speed"
-    ElseIf CDbl(bitsPerSecond) >= 1000000000# Then
-        FormatLinkSpeed = CStr(Round(CDbl(bitsPerSecond) / 1000000000#, 1)) & " Gbps"
-    ElseIf CDbl(bitsPerSecond) >= 1000000# Then
-        FormatLinkSpeed = CStr(Round(CDbl(bitsPerSecond) / 1000000#, 0)) & " Mbps"
+    ElseIf CDbl(bitsPerSecond) >= 1E+9 Then
+        FormatLinkSpeed = CStr(Round(CDbl(bitsPerSecond) / 1E+9, 1)) & " Gbps"
+    ElseIf CDbl(bitsPerSecond) >= 1E+6 Then
+        FormatLinkSpeed = CStr(Round(CDbl(bitsPerSecond) / 1E+6, 0)) & " Mbps"
     Else
-        FormatLinkSpeed = CStr(Round(CDbl(bitsPerSecond) / 1000#, 0)) & " Kbps"
+        FormatLinkSpeed = CStr(Round(CDbl(bitsPerSecond) / 1E+3, 0)) & " Kbps"
     End If
 End Function
 
