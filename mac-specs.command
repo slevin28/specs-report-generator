@@ -157,14 +157,27 @@ done < <(printf '%s\n' "$DISPLAY_PROFILE" | awk '
 # ---------- STORAGE SECTION ----------
 DISK_HTML=""
 
+get_smart_status() {
+    smart_disk_id="$1"
+    if [ -z "$smart_disk_id" ]; then
+        printf '%s' "Not reported"
+        return
+    fi
+
+    smart_status=$(diskutil info "$smart_disk_id" 2>/dev/null | awk -F': *' '/^[ \t]*SMART Status:/ {print $2; exit}')
+    if [ -z "$smart_status" ]; then smart_status="Not reported"; fi
+    printf '%s' "$smart_status"
+}
+
 # Query each storage data type separately. Lion ignores the newer NVMe type while
 # later macOS versions still report it.
-while IFS="|" read -r d_model d_size d_type d_bus; do
+while IFS="|" read -r d_model d_size d_type d_bus d_disk_id d_smart; do
     if [ -z "$d_model" ]; then continue; fi
     if [ -z "$d_size" ]; then d_size="Unknown"; fi
     if [ -z "$d_type" ]; then d_type="Unknown"; fi
     if [ -z "$d_bus" ]; then d_bus="Unknown"; fi
-    DISK_HTML="${DISK_HTML}<tr><td>${d_model}</td><td>${d_size}</td><td>${d_type}</td><td>${d_bus}</td></tr>"
+    if [ -z "$d_smart" ]; then d_smart=$(get_smart_status "$d_disk_id"); fi
+    DISK_HTML="${DISK_HTML}<tr><td>${d_model}</td><td>${d_size}</td><td>${d_type}</td><td>${d_bus}</td><td>${d_smart}</td></tr>"
 done < <(
     for profiler_type in SPSerialATADataType SPATADataType SPNVMeDataType; do
         if [ "$profiler_type" = "SPSerialATADataType" ]; then
@@ -186,16 +199,16 @@ done < <(
                 else if (lower ~ /hdd/ || lower ~ /hard/) type="Hard Disk"
                 else type="Unknown"
             }
-            print model "|" size "|" type "|" bus
+            print model "|" size "|" type "|" bus "|" disk_id "|" smart
         }
         /^__REPORT_BUS__:/ {
             emit()
-            model=""; size=""; type=""; bus=clean($2)
+            model=""; size=""; type=""; disk_id=""; smart=""; bus=clean($2)
             next
         }
         /^[ \t]*Model:/ {
             emit()
-            model=clean($2); size=""; type=""
+            model=clean($2); size=""; type=""; disk_id=""; smart=""
             next
         }
         /^[ \t]*Capacity:/ {
@@ -207,6 +220,14 @@ done < <(
             if (medium ~ /Rotational/) type="Hard Disk"
             else if (medium ~ /Solid State/) type="Solid State"
             else type=medium
+            next
+        }
+        /^[ \t]*BSD Name:/ {
+            disk_id=clean($2)
+            next
+        }
+        /^[ \t]*S\.M\.A\.R\.T\. [Ss]tatus:/ {
+            smart=clean($2)
             next
         }
         END { emit() }
@@ -227,13 +248,14 @@ if [ -z "$DISK_HTML" ]; then
             Yes) continue ;;
         esac
 
-        IFS="|" read -r d_model d_size d_bus d_ssd < <(printf '%s\n' "$disk_info" | awk -F': *' '
+        IFS="|" read -r d_model d_size d_bus d_ssd d_smart < <(printf '%s\n' "$disk_info" | awk -F': *' '
             function clean(v) { sub(/^[ \t]+/, "", v); sub(/[ \t]+$/, "", v); return v }
             /^[ \t]*Device \/ Media Name:/ { model=clean($2) }
             /^[ \t]*(Disk Size|Total Size):/ { size=clean($2); sub(/[ \t]*\(.*/, "", size) }
             /^[ \t]*(Protocol|Bus Protocol):/ { bus=clean($2) }
             /^[ \t]*Solid State:/ { ssd=clean($2) }
-            END { print model "|" size "|" bus "|" ssd }
+            /^[ \t]*SMART Status:/ { smart=clean($2) }
+            END { print model "|" size "|" bus "|" ssd "|" smart }
         ')
 
         d_model="${d_model% Media}"
@@ -255,35 +277,13 @@ if [ -z "$DISK_HTML" ]; then
                 esac
                 ;;
         esac
-        DISK_HTML="${DISK_HTML}<tr><td>${d_model}</td><td>${d_size}</td><td>${d_type}</td><td>${d_bus}</td></tr>"
+        if [ -z "$d_smart" ]; then d_smart="Not reported"; fi
+        DISK_HTML="${DISK_HTML}<tr><td>${d_model}</td><td>${d_size}</td><td>${d_type}</td><td>${d_bus}</td><td>${d_smart}</td></tr>"
     done < <(diskutil list 2>/dev/null | awk '/^\/dev\/disk[0-9]+/ { if (!seen[$1]++) print $1 }')
 fi
 
 if [ -z "$DISK_HTML" ]; then
-    DISK_HTML="<tr><td>Unable to detect physical drives</td><td>Unknown</td><td>Unknown</td><td>Unknown</td></tr>"
-fi
-
-# ---------- BASIC SMART STATUS ----------
-SMART_HTML=""
-while IFS= read -r disk_id; do
-    if [ -z "$disk_id" ]; then continue; fi
-    disk_info=$(diskutil info "$disk_id" 2>/dev/null)
-    d_location=$(printf '%s\n' "$disk_info" | awk -F': *' '/^[ \t]*(Internal|Device Location):/ {print $2; exit}')
-    d_virtual=$(printf '%s\n' "$disk_info" | awk -F': *' '/^[ \t]*Virtual:/ {print $2; exit}')
-    case "$d_location" in
-        No|External) continue ;;
-    esac
-    case "$d_virtual" in
-        Yes) continue ;;
-    esac
-    smart_model=$(printf '%s\n' "$disk_info" | awk -F': *' '/^[ \t]*Device \/ Media Name:/ {print $2; exit}')
-    smart_status=$(printf '%s\n' "$disk_info" | awk -F': *' '/^[ \t]*SMART Status:/ {print $2; exit}')
-    if [ -z "$smart_model" ]; then smart_model="$disk_id"; fi
-    if [ -z "$smart_status" ]; then smart_status="Not reported"; fi
-    SMART_HTML="${SMART_HTML}<tr><td>${smart_model}</td><td>${smart_status}</td></tr>"
-done < <(diskutil list 2>/dev/null | awk '/^\/dev\/disk[0-9]+/ { if (!seen[$1]++) print $1 }')
-if [ -z "$SMART_HTML" ]; then
-    SMART_HTML="<tr><td>Internal storage</td><td>Not reported</td></tr>"
+    DISK_HTML="<tr><td>Unable to detect physical drives</td><td>Unknown</td><td>Unknown</td><td>Unknown</td><td>Not reported</td></tr>"
 fi
 
 # ---------- BATTERY HEALTH ----------
@@ -545,15 +545,8 @@ td { padding: 8px; border-bottom: 1px solid #eaeaea; }
         <div class="section">
             <h2>Storage Drives</h2>
             <table>
-                <tr><th>Model</th><th>Size</th><th>Type</th><th>Bus</th></tr>
+                <tr><th>Model</th><th>Size</th><th>Type</th><th>Bus</th><th>SMART</th></tr>
                 ${DISK_HTML}
-            </table>
-        </div>
-        <div class="section">
-            <h2>Storage SMART Status</h2>
-            <table>
-                <tr><th>Drive</th><th>SMART</th></tr>
-                ${SMART_HTML}
             </table>
         </div>
         <div class="section">
