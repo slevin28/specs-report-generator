@@ -39,13 +39,21 @@ $LogoBase64 = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAlYAAADLCAYAAACswt2
 # COMPUTER SPECIFICATION HTML REPORT
 # ============================================
 
+$ReportStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+$CimTimeoutSeconds = 8
+
+function Write-ReportStage($Stage) {
+    Write-Host ("[{0,6:N1}s] {1}" -f $ReportStopwatch.Elapsed.TotalSeconds, $Stage)
+}
+
 # ---------- SYSTEM INFO ----------
-$ComputerInfo = Get-CimInstance Win32_ComputerSystem
-$Product      = Get-CimInstance Win32_ComputerSystemProduct
-$BIOS         = Get-CimInstance Win32_BIOS
-$OS           = Get-CimInstance Win32_OperatingSystem
-$GPU          = @(Get-CimInstance Win32_VideoController)
-$Enclosure    = Get-CimInstance Win32_SystemEnclosure | Select-Object -First 1
+Write-ReportStage "Reading core hardware"
+$ComputerInfo = Get-CimInstance Win32_ComputerSystem -OperationTimeoutSec $CimTimeoutSeconds
+$Product      = Get-CimInstance Win32_ComputerSystemProduct -OperationTimeoutSec $CimTimeoutSeconds
+$BIOS         = Get-CimInstance Win32_BIOS -OperationTimeoutSec $CimTimeoutSeconds
+$OS           = Get-CimInstance Win32_OperatingSystem -OperationTimeoutSec $CimTimeoutSeconds
+$GPU          = @(Get-CimInstance Win32_VideoController -OperationTimeoutSec $CimTimeoutSeconds)
+$Enclosure    = Get-CimInstance Win32_SystemEnclosure -OperationTimeoutSec $CimTimeoutSeconds | Select-Object -First 1
 
 # ---------- LENOVO FRIENDLY NAME CHECK ----------
 $DisplayModel = $ComputerInfo.Model
@@ -66,7 +74,7 @@ if (-not $IsLaptop -and $Enclosure) {
 $FormFactorStatus = if ($IsLaptop) { "Laptop / Portable" } elseif ($ComputerInfo.PCSystemType -eq 1) { "Desktop" } else { "Desktop / Other" }
 
 # ---------- CPU INFO ----------
-$RawCPU = Get-CimInstance Win32_Processor | Select-Object -First 1
+$RawCPU = Get-CimInstance Win32_Processor -OperationTimeoutSec $CimTimeoutSeconds | Select-Object -First 1
 
 # Check if the manufacturer's name string already contains the "@" speed symbol
 if ($RawCPU.Name -match "@") {
@@ -82,7 +90,7 @@ else {
 
 
 # ---------- RAM INFO ----------
-$PhysicalMemory = @(Get-CimInstance Win32_PhysicalMemory)
+$PhysicalMemory = @(Get-CimInstance Win32_PhysicalMemory -OperationTimeoutSec $CimTimeoutSeconds)
 
 $TotalSystemRAMGB = [math]::Round(($PhysicalMemory | Measure-Object -Property Capacity -Sum).Sum / 1GB, 0)
 
@@ -103,31 +111,32 @@ if ($PhysicalMemory.Count -gt 4) { $RamIsReliable = $false }
 if ($DetectedRAMGB -ne $TotalSystemRAMGB) { $RamIsReliable = $false }
 if (($PhysicalMemory | Where-Object { $_.Capacity -lt 4GB }).Count -gt 2) { $RamIsReliable = $false }
 
-$DiskDrives = @(Get-CimInstance Win32_DiskDrive | Where-Object {
+Write-ReportStage "Reading storage"
+$DiskDrives = @(Get-CimInstance Win32_DiskDrive -OperationTimeoutSec $CimTimeoutSeconds | Where-Object {
     $_.PNPDeviceID -notmatch "^(USB|USBSTOR)" -and
     $_.InterfaceType -notmatch "USB" -and
     $_.MediaType -notmatch "Removable" -and
     $_.Size -gt 0
 } | Sort-Object Index)
 $StorageDisks = @()
-if (Get-Command Get-Disk -ErrorAction SilentlyContinue) {
-    $StorageDisks = @(Get-Disk -ErrorAction SilentlyContinue)
-}
 $PhysDisks = @()
-if (Get-Command Get-PhysicalDisk -ErrorAction SilentlyContinue) {
-    $PhysDisks = @(Get-PhysicalDisk -ErrorAction SilentlyContinue)
-}
+try {
+    # Query the storage provider directly. This avoids module auto-loading and
+    # prevents a damaged storage provider from holding the whole report open.
+    $StorageDisks = @(Get-CimInstance -Namespace "root\Microsoft\Windows\Storage" -ClassName MSFT_Disk -OperationTimeoutSec $CimTimeoutSeconds -ErrorAction Stop)
+    $PhysDisks = @(Get-CimInstance -Namespace "root\Microsoft\Windows\Storage" -ClassName MSFT_PhysicalDisk -OperationTimeoutSec $CimTimeoutSeconds -ErrorAction Stop)
+} catch {}
 
 # ---------- DISPLAY INFO ----------
 # Look for the controller that is actually driving a display (has a resolution)
-$ActiveVideoControllers = @(Get-CimInstance Win32_VideoController | Where-Object {
+$ActiveVideoControllers = @($GPU | Where-Object {
     $_.CurrentHorizontalResolution -ne $null
 })
 $Resolution = $ActiveVideoControllers | Select-Object -First 1
 
 # Fallback: if both are null, try to get it from the desktop monitor class
 if ($null -eq $Resolution) {
-    $Resolution = Get-CimInstance Win32_DesktopMonitor | Where-Object { 
+    $Resolution = Get-CimInstance Win32_DesktopMonitor -OperationTimeoutSec $CimTimeoutSeconds | Where-Object {
         $_.ScreenWidth -ne $null 
     } | Select-Object -First 1
     # Standardize names for the HTML
@@ -139,7 +148,7 @@ if ($null -eq $Resolution) {
 }
 
 # ---------- BATTERY INFO ----------
-$Battery = Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue
+$Battery = Get-CimInstance Win32_Battery -OperationTimeoutSec $CimTimeoutSeconds -ErrorAction SilentlyContinue
 
 # ---------- TOUCHSCREEN INFO ----------
 # SM_DIGITIZER and SM_MAXIMUMTOUCHES are the same Windows metrics used by
@@ -174,7 +183,7 @@ public static class SpecsReportNativeMethods {
         $TouchscreenStatus = "No"
     }
 } catch {
-    $TouchDevice = Get-CimInstance Win32_PnPEntity -ErrorAction SilentlyContinue |
+    $TouchDevice = Get-CimInstance Win32_PnPEntity -Filter "Status = 'OK' AND (Name LIKE '%touch screen%' OR Name LIKE '%touchscreen%')" -Property Name, Status -OperationTimeoutSec $CimTimeoutSeconds -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -match "touch\s*screen|touchscreen" -and $_.Status -eq "OK" } |
         Select-Object -First 1
     if ($TouchDevice) { $TouchscreenStatus = "Yes" }
@@ -187,13 +196,11 @@ $WindowsLicenses = $null
 try {
     $WindowsLicenses = Get-CimInstance -ClassName SoftwareLicensingProduct `
         -Filter "ApplicationID='55c92734-d682-4d71-983e-d6ec3f16059f'" `
+        -Property Description, PartialProductKey, LicenseStatus `
+        -OperationTimeoutSec $CimTimeoutSeconds `
         -ErrorAction Stop
 } catch {
-    if (Get-Command Get-WmiObject -ErrorAction SilentlyContinue) {
-        $WindowsLicenses = Get-WmiObject -Class SoftwareLicensingProduct `
-            -Filter "ApplicationID='55c92734-d682-4d71-983e-d6ec3f16059f'" `
-            -ErrorAction SilentlyContinue
-    }
+    # Keep the report moving if the licensing provider is unavailable.
 }
 
 $WindowsLicenseCandidates = @($WindowsLicenses |
@@ -261,7 +268,53 @@ function Normalize-MediaType($Value) {
     if ($null -eq $Value) { return "Unknown" }
     $text = ([string]$Value).Trim()
     if ([string]::IsNullOrWhiteSpace($text) -or $text -eq "0" -or $text -eq "Unspecified") { return "Unknown" }
+    if ($text -match '^\d+$') {
+        return switch ([int]$text) {
+            3 { "HDD" }
+            4 { "SSD" }
+            5 { "Storage Class Memory" }
+            Default { "Unknown" }
+        }
+    }
     return $text
+}
+
+function Format-StorageBusType($Value) {
+    if ($null -eq $Value) { return "Unknown" }
+    $text = ([string]$Value).Trim()
+    if ([string]::IsNullOrWhiteSpace($text)) { return "Unknown" }
+    if ($text -notmatch '^\d+$') { return $text }
+    return switch ([int]$text) {
+        1 { "SCSI" }
+        2 { "ATAPI" }
+        3 { "ATA" }
+        4 { "IEEE 1394" }
+        6 { "Fibre Channel" }
+        7 { "USB" }
+        8 { "RAID" }
+        9 { "iSCSI" }
+        10 { "SAS" }
+        11 { "SATA" }
+        12 { "SD" }
+        13 { "MMC" }
+        15 { "Virtual" }
+        16 { "Storage Spaces" }
+        17 { "NVMe" }
+        Default { "Unknown" }
+    }
+}
+
+function Format-StorageHealth($Value) {
+    if ($null -eq $Value) { return "Unknown" }
+    $text = ([string]$Value).Trim()
+    if ([string]::IsNullOrWhiteSpace($text)) { return "Unknown" }
+    if ($text -notmatch '^\d+$') { return $text }
+    return switch ([int]$text) {
+        0 { "Healthy" }
+        1 { "Warning" }
+        2 { "Unhealthy" }
+        Default { "Unknown" }
+    }
 }
 
 function Format-LinkSpeed($BitsPerSecond) {
@@ -284,6 +337,35 @@ function Get-FirmwareState($Value) {
     if ($text -match '(?i)deactivat|disabled|disable|not enabled|off') { return "Disabled / Deactivated" }
     if ($text -match '(?i)activat|enabled|enable|on') { return "Enabled / Activated" }
     return "Setting present; state unclear"
+}
+
+function Invoke-NativeWithTimeout {
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [string[]]$Arguments = @(),
+        [int]$TimeoutMilliseconds = 8000
+    )
+
+    $stdoutPath = [System.IO.Path]::GetTempFileName()
+    $stderrPath = [System.IO.Path]::GetTempFileName()
+    $process = $null
+    try {
+        $process = Start-Process -FilePath $FilePath -ArgumentList $Arguments -NoNewWindow `
+            -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath `
+            -PassThru -ErrorAction Stop
+        if (-not $process.WaitForExit($TimeoutMilliseconds)) {
+            try {
+                $process.Kill()
+                $null = $process.WaitForExit(1000)
+            } catch {}
+            return @()
+        }
+        return @(Get-Content -LiteralPath $stdoutPath -ErrorAction SilentlyContinue)
+    } catch {
+        return @()
+    } finally {
+        Remove-Item -LiteralPath $stdoutPath, $stderrPath -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Convert-BatteryCapacityToInt($CapacityText) {
@@ -410,7 +492,8 @@ function Get-BatteryRecordsFromReport($BatteryContent) {
 }
 
 # ---------- BUYER-FACING HARDWARE & MANAGEMENT CHECKS ----------
-$MemoryArrays = @(Get-CimInstance Win32_PhysicalMemoryArray -ErrorAction SilentlyContinue)
+Write-ReportStage "Checking hardware and management state"
+$MemoryArrays = @(Get-CimInstance Win32_PhysicalMemoryArray -OperationTimeoutSec $CimTimeoutSeconds -ErrorAction SilentlyContinue)
 $SystemMemoryArrays = @($MemoryArrays | Where-Object { $_.Use -eq 3 -and $_.MemoryDevices -gt 0 })
 if ($SystemMemoryArrays.Count -eq 0) {
     $SystemMemoryArrays = @($MemoryArrays | Where-Object { $_.MemoryDevices -gt 0 })
@@ -435,9 +518,9 @@ if ($IsLaptop) {
     $BuiltInDisplaySize = "Unknown (internal-panel EDID not reported)"
     $InternalMonitor = $null
     try {
-        $ActiveMonitorParams = @(Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorBasicDisplayParams -ErrorAction Stop |
+        $ActiveMonitorParams = @(Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorBasicDisplayParams -OperationTimeoutSec $CimTimeoutSeconds -ErrorAction Stop |
             Where-Object { $_.Active -and $_.MaxHorizontalImageSize -gt 0 -and $_.MaxVerticalImageSize -gt 0 })
-        $InternalConnections = @(Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorConnectionParams -ErrorAction Stop |
+        $InternalConnections = @(Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorConnectionParams -OperationTimeoutSec $CimTimeoutSeconds -ErrorAction Stop |
             Where-Object { [uint32]$_.VideoOutputTechnology -eq [uint32]2147483648 })
         foreach ($connection in $InternalConnections) {
             $InternalMonitor = $ActiveMonitorParams |
@@ -466,7 +549,7 @@ if ($IsLaptop) {
 }
 
 $WifiGeneration = "Not detected"
-$WlanOutput = @(& netsh.exe wlan show drivers 2>$null)
+$WlanOutput = @(Invoke-NativeWithTimeout -FilePath "$env:SystemRoot\System32\netsh.exe" -Arguments @("wlan", "show", "drivers"))
 if ($WlanOutput.Count -gt 0) {
     $WifiStandards = @([regex]::Matches(($WlanOutput -join " "), '802\.11(?:be|ax|ac|n|g|b|a)', 'IgnoreCase') |
         ForEach-Object { $_.Value.ToLowerInvariant() } |
@@ -485,7 +568,7 @@ if ($WlanOutput.Count -gt 0) {
 }
 
 $EthernetSummaries = @()
-$EthernetAdapters = @(Get-CimInstance Win32_NetworkAdapter -ErrorAction SilentlyContinue | Where-Object {
+$EthernetAdapters = @(Get-CimInstance Win32_NetworkAdapter -OperationTimeoutSec $CimTimeoutSeconds -ErrorAction SilentlyContinue | Where-Object {
     $_.PhysicalAdapter -and
     ($_.AdapterTypeID -eq 0 -or $_.AdapterType -match "Ethernet") -and
     ("$($_.Name) $($_.Description)" -notmatch "Wireless|Wi-Fi|WiFi|Bluetooth|Virtual|VPN")
@@ -501,7 +584,8 @@ foreach ($adapter in $EthernetAdapters) {
 }
 $EthernetStatus = if ($EthernetSummaries.Count -gt 0) { $EthernetSummaries -join "; " } else { "Not detected" }
 
-$PnPDevices = @(Get-CimInstance Win32_PnPEntity -ErrorAction SilentlyContinue)
+$PnPFilter = "Status = 'OK' AND (PNPClass = 'Biometric' OR Name LIKE '%fingerprint%' OR Name LIKE '%backlit keyboard%' OR Name LIKE '%keyboard backlight%' OR Name LIKE '%illuminated keyboard%')"
+$PnPDevices = @(Get-CimInstance Win32_PnPEntity -Filter $PnPFilter -Property Name, Status, PNPClass -OperationTimeoutSec $CimTimeoutSeconds -ErrorAction SilentlyContinue)
 $FingerprintDevices = @($PnPDevices | Where-Object {
     $_.Status -eq "OK" -and (
         $_.Name -match "fingerprint" -or
@@ -510,7 +594,7 @@ $FingerprintDevices = @($PnPDevices | Where-Object {
 } | Select-Object -ExpandProperty Name -Unique)
 $FingerprintStatus = if ($FingerprintDevices.Count -gt 0) { "Detected ($($FingerprintDevices -join ', '))" } else { "Not detected" }
 
-$OpticalDevices = @(Get-CimInstance Win32_CDROMDrive -ErrorAction SilentlyContinue | Where-Object {
+$OpticalDevices = @(Get-CimInstance Win32_CDROMDrive -Property Name, PNPDeviceID -OperationTimeoutSec $CimTimeoutSeconds -ErrorAction SilentlyContinue | Where-Object {
     $_.PNPDeviceID -notmatch "^ROOT\\" -and $_.Name -notmatch "Virtual"
 } | Select-Object -ExpandProperty Name -Unique)
 $OpticalDriveStatus = if ($OpticalDevices.Count -gt 0) { "Detected ($($OpticalDevices -join ', '))" } else { "Not detected" }
@@ -529,7 +613,7 @@ $EntraIdStatus = "Not reported"
 $WorkplaceJoinStatus = "Not reported"
 $DsregPath = "$env:SystemRoot\System32\dsregcmd.exe"
 if (Test-Path $DsregPath) {
-    $DsregOutput = @(& $DsregPath /status 2>$null) -join "`n"
+    $DsregOutput = @(Invoke-NativeWithTimeout -FilePath $DsregPath -Arguments @("/status")) -join "`n"
     if (-not [string]::IsNullOrWhiteSpace($DsregOutput)) {
         $EntraIdStatus = if ($DsregOutput -match '(?im)^\s*AzureAdJoined\s*:\s*YES\s*$') { "Joined" } else { "Not joined" }
         $WorkplaceJoinStatus = if ($DsregOutput -match '(?im)^\s*WorkplaceJoined\s*:\s*YES\s*$') { "Joined" } else { "Not joined" }
@@ -543,6 +627,7 @@ $MdmActiveCandidates = @()
 $MdmCheckCompleted = $false
 try {
     $EnrollmentKeys = @(Get-ChildItem "HKLM:\SOFTWARE\Microsoft\Enrollments" -ErrorAction Stop)
+    $EnterpriseTaskRoot = Join-Path $env:SystemRoot "System32\Tasks\Microsoft\Windows\EnterpriseMgmt"
     foreach ($key in $EnrollmentKeys) {
         $enrollmentId = [string]$key.PSChildName
         if ($enrollmentId -notmatch '^\{?[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\}?$') {
@@ -567,13 +652,16 @@ try {
 
         $omadmPath = "HKLM:\SOFTWARE\Microsoft\Provisioning\OMADM\Accounts\$enrollmentId"
         $hasOmadmAccount = Test-Path $omadmPath
-        $enterpriseTaskCount = 0
-        if (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue) {
-            try {
-                $taskPath = "\Microsoft\Windows\EnterpriseMgmt\$enrollmentId\"
-                $enterpriseTaskCount = @(Get-ScheduledTask -TaskPath $taskPath -ErrorAction Stop).Count
-            } catch {}
+        # Scheduled tasks are stored as files under this local folder. Reading
+        # it directly is much faster than invoking the ScheduledTasks provider.
+        $taskFolder = Join-Path $EnterpriseTaskRoot $enrollmentId
+        if (-not (Test-Path -LiteralPath $taskFolder)) {
+            $taskFolder = Join-Path $EnterpriseTaskRoot $enrollmentId.Trim('{}')
         }
+        $enterpriseTaskCount = @(
+            Get-ChildItem -LiteralPath $taskFolder -ErrorAction SilentlyContinue |
+                Where-Object { -not $_.PSIsContainer }
+        ).Count
 
         $providerText = if (-not [string]::IsNullOrWhiteSpace($providerId)) { $providerId } else { "provider not named" }
         $stateText = if ($null -ne $properties.EnrollmentState) { [string]$properties.EnrollmentState } else { "not reported" }
@@ -626,7 +714,7 @@ $LenovoBiosSettings = @()
 $HpBiosSettings = @()
 if ($ComputerInfo.Manufacturer -match "Dell") {
     try {
-        $DellBiosAttributes = @(Get-CimInstance -Namespace "root\dcim\sysman\biosattributes" -ClassName EnumerationAttribute -ErrorAction Stop)
+        $DellBiosAttributes = @(Get-CimInstance -Namespace "root\dcim\sysman\biosattributes" -ClassName EnumerationAttribute -OperationTimeoutSec $CimTimeoutSeconds -ErrorAction Stop)
         $passwordAttribute = $DellBiosAttributes |
             Where-Object { $_.AttributeName -match "Admin.*Password|AdminPwd|Setup.*Password" } |
             Select-Object -First 1
@@ -642,18 +730,18 @@ if ($ComputerInfo.Manufacturer -match "Dell") {
     } catch {}
 } elseif ($ComputerInfo.Manufacturer -match "Lenovo") {
     try {
-        $passwordSettings = Get-CimInstance -Namespace "root\wmi" -ClassName Lenovo_BiosPasswordSettings -ErrorAction Stop |
+        $passwordSettings = Get-CimInstance -Namespace "root\wmi" -ClassName Lenovo_BiosPasswordSettings -OperationTimeoutSec $CimTimeoutSeconds -ErrorAction Stop |
             Select-Object -First 1
         if ($passwordSettings -and $null -ne $passwordSettings.PasswordState) {
             $BiosPasswordStatus = if ([int]$passwordSettings.PasswordState -eq 0) { "Not configured" } else { "Configured" }
         }
     } catch {}
     try {
-        $LenovoBiosSettings = @(Get-CimInstance -Namespace "root\wmi" -ClassName Lenovo_BiosSetting -ErrorAction SilentlyContinue)
+        $LenovoBiosSettings = @(Get-CimInstance -Namespace "root\wmi" -ClassName Lenovo_BiosSetting -OperationTimeoutSec $CimTimeoutSeconds -ErrorAction SilentlyContinue)
     } catch {}
 } elseif ($ComputerInfo.Manufacturer -match "HP|Hewlett") {
     try {
-        $HpBiosSettings = @(Get-CimInstance -Namespace "root\HP\InstrumentedBIOS" -ClassName HP_BIOSSetting -ErrorAction Stop)
+        $HpBiosSettings = @(Get-CimInstance -Namespace "root\HP\InstrumentedBIOS" -ClassName HP_BIOSSetting -OperationTimeoutSec $CimTimeoutSeconds -ErrorAction Stop)
         $passwordSetting = $HpBiosSettings |
             Where-Object { $_.Name -match "Setup Password|Administrator Password" } |
             Select-Object -First 1
@@ -687,7 +775,8 @@ if ($DellBiosAttributes.Count -gt 0) {
     }
 }
 
-$AbsoluteAgent = Get-CimInstance Win32_Service -ErrorAction SilentlyContinue |
+$AbsoluteAgentFilter = "Name LIKE '%rpcnet%' OR DisplayName LIKE '%computrace%' OR DisplayName LIKE '%absolute persistence%' OR DisplayName LIKE '%absolute agent%'"
+$AbsoluteAgent = Get-CimInstance Win32_Service -Filter $AbsoluteAgentFilter -Property Name, DisplayName -OperationTimeoutSec $CimTimeoutSeconds -ErrorAction SilentlyContinue |
     Where-Object { "$($_.Name) $($_.DisplayName)" -match "(?i)rpcnet|computrace|absolute persistence|absolute agent" } |
     Select-Object -First 1
 if (-not [string]::IsNullOrWhiteSpace($AbsoluteFirmwareStatus) -and $AbsoluteAgent) {
@@ -702,7 +791,7 @@ if (-not [string]::IsNullOrWhiteSpace($AbsoluteFirmwareStatus) -and $AbsoluteAge
 
 $SmartPredictions = @()
 try {
-    $SmartPredictions = @(Get-CimInstance -Namespace root\wmi -ClassName MSStorageDriver_FailurePredictStatus -ErrorAction Stop)
+    $SmartPredictions = @(Get-CimInstance -Namespace root\wmi -ClassName MSStorageDriver_FailurePredictStatus -OperationTimeoutSec $CimTimeoutSeconds -ErrorAction Stop)
 } catch {}
 
 # ---------- RAM SECTION ----------
@@ -735,7 +824,8 @@ foreach ($disk in $DiskDrives) {
     $sizeBytes = if ($storageDisk -and $storageDisk.Size -gt 0) { $storageDisk.Size } else { $disk.Size }
     $size = Format-StorageSize $sizeBytes
     $model = if ($storageDisk -and -not [string]::IsNullOrWhiteSpace($storageDisk.FriendlyName)) { $storageDisk.FriendlyName } else { $disk.Model }
-    $bus = if ($storageDisk -and -not [string]::IsNullOrWhiteSpace([string]$storageDisk.BusType) -and ([string]$storageDisk.BusType -ne "Unknown")) { $storageDisk.BusType } else { $disk.InterfaceType }
+    $storageBus = if ($storageDisk) { Format-StorageBusType $storageDisk.BusType } else { "Unknown" }
+    $bus = if ($storageBus -ne "Unknown") { $storageBus } else { $disk.InterfaceType }
     $media = if ($storageDisk) { Normalize-MediaType $storageDisk.MediaType } else { "Unknown" }
 
     $match = $null
@@ -761,7 +851,7 @@ foreach ($disk in $DiskDrives) {
 
     $health = "Unknown"
     if ($match -and -not [string]::IsNullOrWhiteSpace([string]$match.HealthStatus)) {
-        $health = [string]$match.HealthStatus
+        $health = Format-StorageHealth $match.HealthStatus
     }
     if (($health -eq "Unknown" -or [string]::IsNullOrWhiteSpace($health)) -and $SmartPredictions.Count -gt 0) {
         $diskIdentifier = Normalize-Identifier $disk.PNPDeviceID
@@ -829,7 +919,10 @@ foreach ($g in $GPU) {
 $BatteryHTML = "<p style='font-size: var(--font-small); margin: var(--pad-sm) 0;'>No Battery Detected</p>"
 if ($IsLaptop) {
     $BatteryPath = "$env:TEMP\battery-report.html"
-    powercfg /batteryreport /output $BatteryPath > $null 2>&1
+    Remove-Item -LiteralPath $BatteryPath -Force -ErrorAction SilentlyContinue
+    Invoke-NativeWithTimeout -FilePath "$env:SystemRoot\System32\powercfg.exe" `
+        -Arguments @("/batteryreport", "/output", "`"$BatteryPath`"") `
+        -TimeoutMilliseconds 15000 | Out-Null
     if (Test-Path $BatteryPath) {
         $BatteryContent = Get-Content $BatteryPath -Raw
         $BatteryRecords = @(Get-BatteryRecordsFromReport $BatteryContent)
@@ -900,6 +993,7 @@ $BatteryRows
 
 
 # ---------- HTML REPORT ----------
+Write-ReportStage "Building report"
 $ReportDate = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
 
 $HTML = @"
@@ -1205,3 +1299,5 @@ $HTML | Out-File -FilePath $OutputPath -Encoding UTF8
 
 # ---------- OPEN REPORT ----------
 Start-Process $OutputPath
+$ReportStopwatch.Stop()
+Write-Host ("Report generated in {0:N1} seconds: {1}" -f $ReportStopwatch.Elapsed.TotalSeconds, $OutputPath)
