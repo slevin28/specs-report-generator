@@ -8,7 +8,7 @@ Dim manufacturer, model, serialNumber, computerName, osText, processorText
 Dim formFactor, isLaptop, installedRamText, ramSlotsText, activationText
 Dim memoryRows, memoryModules, memoryArrays, item, capacity, sizeGb
 Dim memoryType, memorySpeed, memoryManufacturer, memoryPart, memoryLocator
-Dim moduleCount, locatorCount, reportedSlots, totalModuleGb, useCode
+Dim moduleCount, locatorCount, reportedSlots, totalModuleGb, useCode, slotCount
 Dim graphicsRows, displayResolution, laptopDisplayRows, videoControllers
 Dim activeVideoCount, activeRefresh, videoName, vramText
 Dim pnpDevices, pnpName, pnpStatus, touchDevices, fingerprintDevices
@@ -72,11 +72,18 @@ Function GetProp(objectValue, propertyName)
 End Function
 
 Function Clean(value)
-    If IsNull(value) Or IsEmpty(value) Then
+    On Error Resume Next
+    Clean = ""
+    If IsNull(value) Or IsEmpty(value) Or IsArray(value) Or IsObject(value) Then
         Clean = ""
     Else
         Clean = Trim(CStr(value))
     End If
+    If Err.Number <> 0 Then
+        Err.Clear
+        Clean = ""
+    End If
+    On Error GoTo 0
 End Function
 
 Function Html(value)
@@ -146,12 +153,36 @@ Function FormatLinkSpeed(bitsPerSecond)
     End If
 End Function
 
+Function WmiInteger(value)
+    On Error Resume Next
+    Dim numberValue
+    ' Legacy BIOS providers may return malformed values or the UINT16 unknown
+    ' sentinel (65535). Treat those as unavailable instead of aborting the report.
+    WmiInteger = -1
+    If Not IsNumeric(value) Then Exit Function
+    Err.Clear
+    numberValue = CDbl(value)
+    If Err.Number <> 0 Then
+        Err.Clear
+        Exit Function
+    End If
+    If numberValue < 0 Or numberValue > 32767 Then Exit Function
+    WmiInteger = CInt(numberValue)
+    If Err.Number <> 0 Then
+        Err.Clear
+        WmiInteger = -1
+    End If
+    On Error GoTo 0
+End Function
+
 Function MemoryTypeName(typeCode)
-    If Not IsNumeric(typeCode) Then
+    Dim integerCode
+    integerCode = WmiInteger(typeCode)
+    If integerCode < 0 Then
         MemoryTypeName = "Unknown"
         Exit Function
     End If
-    Select Case CInt(typeCode)
+    Select Case integerCode
         Case 17: MemoryTypeName = "SDRAM"
         Case 18: MemoryTypeName = "SGRAM"
         Case 19: MemoryTypeName = "RDRAM"
@@ -171,18 +202,22 @@ Function IsPortable(enclosureObject, computerObject)
         chassisValues = GetProp(enclosureObject, "ChassisTypes")
         If IsArray(chassisValues) Then
             For Each chassisValue In chassisValues
-                Select Case CInt(chassisValue)
-                    Case 8, 9, 10, 11, 12, 14, 18, 21
+                Select Case WmiInteger(chassisValue)
+                    Case 8, 9, 10, 11, 12, 14, 18, 21, 30, 31, 32
                         IsPortable = True
                         Exit Function
                 End Select
             Next
+        Else
+            Select Case WmiInteger(chassisValues)
+                Case 8, 9, 10, 11, 12, 14, 18, 21, 30, 31, 32
+                    IsPortable = True
+                    Exit Function
+            End Select
         End If
     End If
     pcSystemType = GetProp(computerObject, "PCSystemType")
-    If IsNumeric(pcSystemType) Then
-        If CInt(pcSystemType) = 2 Then IsPortable = True
-    End If
+    If WmiInteger(pcSystemType) = 2 Or WmiInteger(pcSystemType) = 8 Then IsPortable = True
 End Function
 
 Function DictText(dictionaryObject)
@@ -265,8 +300,8 @@ Function XpActivationStatus(service)
     If activations Is Nothing Then Exit Function
     For Each activation In activations
         required = GetProp(activation, "ActivationRequired")
-        If IsNumeric(required) Then
-            If CLng(required) = 0 Then
+        If WmiInteger(required) >= 0 Then
+            If WmiInteger(required) = 0 Then
                 XpActivationStatus = "Activated"
             Else
                 XpActivationStatus = "Not activated"
@@ -287,8 +322,8 @@ Function VendorBiosPasswordStatus(manufacturerName)
         If settings Is Nothing Then Exit Function
         For Each setting In settings
             stateValue = GetProp(setting, "PasswordState")
-            If IsNumeric(stateValue) Then
-                If CLng(stateValue) = 0 Then
+            If WmiInteger(stateValue) >= 0 Then
+                If WmiInteger(stateValue) = 0 Then
                     VendorBiosPasswordStatus = "Not configured"
                 Else
                     VendorBiosPasswordStatus = "Configured"
@@ -305,8 +340,8 @@ Function VendorBiosPasswordStatus(manufacturerName)
             settingName = LCase(Clean(GetProp(setting, "Name")))
             If InStr(settingName, "setup password") > 0 Or InStr(settingName, "administrator password") > 0 Then
                 stateValue = GetProp(setting, "IsSet")
-                If IsNumeric(stateValue) Then
-                    If CLng(stateValue) > 0 Then
+                If WmiInteger(stateValue) >= 0 Then
+                    If WmiInteger(stateValue) > 0 Then
                         VendorBiosPasswordStatus = "Configured"
                     Else
                         VendorBiosPasswordStatus = "Not configured"
@@ -394,11 +429,7 @@ If Not memoryModules Is Nothing Then
                 memoryLocator = Clean(GetProp(item, "DeviceLocator"))
                 If Len(memoryLocator) > 0 Then locatorCount = locatorCount + 1
                 memoryType = GetProp(item, "SMBIOSMemoryType")
-                If IsNumeric(memoryType) Then
-                    If CInt(memoryType) = 0 Then memoryType = GetProp(item, "MemoryType")
-                Else
-                    memoryType = GetProp(item, "MemoryType")
-                End If
+                If WmiInteger(memoryType) <= 0 Then memoryType = GetProp(item, "MemoryType")
                 memorySpeed = DisplayValue(GetProp(item, "Speed"))
                 memoryManufacturer = DisplayValue(GetProp(item, "Manufacturer"))
                 memoryPart = DisplayValue(GetProp(item, "PartNumber"))
@@ -415,15 +446,13 @@ Set memoryArrays = QuerySafe(cim, "SELECT Use, MemoryDevices FROM Win32_Physical
 If Not memoryArrays Is Nothing Then
     For Each item In memoryArrays
         useCode = GetProp(item, "Use")
-        If IsNumeric(GetProp(item, "MemoryDevices")) Then
-            If IsNumeric(useCode) Then
-                If CInt(useCode) = 3 Then reportedSlots = reportedSlots + CInt(GetProp(item, "MemoryDevices"))
-            End If
-        End If
+        slotCount = WmiInteger(GetProp(item, "MemoryDevices"))
+        If WmiInteger(useCode) = 3 And slotCount >= 0 Then reportedSlots = reportedSlots + slotCount
     Next
     If reportedSlots = 0 Then
         For Each item In memoryArrays
-            If IsNumeric(GetProp(item, "MemoryDevices")) Then reportedSlots = reportedSlots + CInt(GetProp(item, "MemoryDevices"))
+            slotCount = WmiInteger(GetProp(item, "MemoryDevices"))
+            If slotCount >= 0 Then reportedSlots = reportedSlots + slotCount
         Next
     End If
 End If
@@ -545,8 +574,8 @@ If Not networkAdapters Is Nothing Then
                 If InStr(adapterType, "ethernet") > 0 And InStr(networkText, "bluetooth") = 0 And InStr(networkText, "virtual") = 0 And InStr(networkText, "vpn") = 0 Then
                     adapterSpeed = FormatLinkSpeed(GetProp(item, "Speed"))
                     adapterState = GetProp(item, "NetConnectionStatus")
-                    If IsNumeric(adapterState) Then
-                        If CInt(adapterState) = 2 Then
+                    If WmiInteger(adapterState) >= 0 Then
+                        If WmiInteger(adapterState) = 2 Then
                             adapterState = "connected"
                         Else
                             adapterState = "disconnected"

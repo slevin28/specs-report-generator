@@ -19,9 +19,17 @@ if not exist "%~dp0windows-specs-xp.vbs" (
     pause
     exit /b 1
 )
-cscript.exe //nologo "%~dp0windows-specs-xp.vbs"
-if errorlevel 1 pause
-exit /b
+rem Preserve the XP script host's exact error and line number for field diagnosis.
+cscript.exe //nologo "%~dp0windows-specs-xp.vbs" > "%TEMP%\SystemSpecs_XP_Run.log" 2>&1
+set "xp_exit=%errorlevel%"
+type "%TEMP%\SystemSpecs_XP_Run.log"
+if not "%xp_exit%"=="0" (
+    echo.
+    echo ERROR: The Windows XP reporter failed.
+    echo Diagnostic log: %TEMP%\SystemSpecs_XP_Run.log
+    pause
+)
+exit /b %xp_exit%
 #>
 
 # --- Embedded Logo ---
