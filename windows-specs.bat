@@ -269,12 +269,13 @@ function Normalize-MediaType($Value) {
     $text = ([string]$Value).Trim()
     if ([string]::IsNullOrWhiteSpace($text) -or $text -eq "0" -or $text -eq "Unspecified") { return "Unknown" }
     if ($text -match '^\d+$') {
-        return switch ([int]$text) {
+        switch ([int]$text) {
             3 { "HDD" }
             4 { "SSD" }
             5 { "Storage Class Memory" }
             Default { "Unknown" }
         }
+        return
     }
     return $text
 }
@@ -284,7 +285,7 @@ function Format-StorageBusType($Value) {
     $text = ([string]$Value).Trim()
     if ([string]::IsNullOrWhiteSpace($text)) { return "Unknown" }
     if ($text -notmatch '^\d+$') { return $text }
-    return switch ([int]$text) {
+    switch ([int]$text) {
         1 { "SCSI" }
         2 { "ATAPI" }
         3 { "ATA" }
@@ -302,6 +303,7 @@ function Format-StorageBusType($Value) {
         17 { "NVMe" }
         Default { "Unknown" }
     }
+    return
 }
 
 function Format-StorageHealth($Value) {
@@ -309,12 +311,13 @@ function Format-StorageHealth($Value) {
     $text = ([string]$Value).Trim()
     if ([string]::IsNullOrWhiteSpace($text)) { return "Unknown" }
     if ($text -notmatch '^\d+$') { return $text }
-    return switch ([int]$text) {
+    switch ([int]$text) {
         0 { "Healthy" }
         1 { "Warning" }
         2 { "Unhealthy" }
         Default { "Unknown" }
     }
+    return
 }
 
 function Format-LinkSpeed($BitsPerSecond) {
