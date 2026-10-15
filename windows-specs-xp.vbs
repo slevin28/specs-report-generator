@@ -6,6 +6,7 @@ Dim fso, shell, desktopPath, reportPath, reportFile
 Dim cim, wmiStorage, computer, bios, operatingSystem, processor, enclosure
 Dim manufacturer, model, serialNumber, computerName, osText, processorText
 Dim formFactor, isLaptop, installedRamText, ramSlotsText, activationText
+Dim usableRamBytes, usableRamText
 Dim memoryRows, memoryModules, memoryArrays, item, capacity, sizeGb
 Dim memoryType, memorySpeed, memoryManufacturer, memoryPart, memoryLocator
 Dim moduleCount, locatorCount, reportedSlots, totalModuleGb, useCode, slotCount
@@ -23,13 +24,24 @@ Dim domainStatus, mdmStatus, entraStatus, biosPasswordStatus, absoluteStatus
 Dim absoluteAgent, services, serviceText, reportId
 
 Function QuerySafe(service, queryText)
+    Dim results, resultCount
     On Error Resume Next
     Set QuerySafe = Nothing
+    Set results = Nothing
     Err.Clear
-    Set QuerySafe = service.ExecQuery(queryText)
+    Set results = service.ExecQuery(queryText)
+    ' XP's WMI provider evaluates many queries lazily. ExecQuery can appear to
+    ' succeed for an unavailable vendor class and then raise 0x80041010 when a
+    ' caller starts a For Each loop. Reading Count here forces evaluation while
+    ' error handling is still active.
+    If Err.Number = 0 Then
+        If Not results Is Nothing Then resultCount = results.Count
+    End If
     If Err.Number <> 0 Then
         Err.Clear
         Set QuerySafe = Nothing
+    Else
+        Set QuerySafe = results
     End If
     On Error GoTo 0
 End Function
@@ -104,6 +116,17 @@ Function DisplayValue(value)
     End If
 End Function
 
+Function ReadRegistryText(shellObject, registryPath)
+    Dim value
+    On Error Resume Next
+    ReadRegistryText = ""
+    Err.Clear
+    value = shellObject.RegRead(registryPath)
+    If Err.Number = 0 Then ReadRegistryText = Clean(value)
+    Err.Clear
+    On Error GoTo 0
+End Function
+
 Function FileSafe(value)
     Dim text, badChars, i
     text = Clean(value)
@@ -126,6 +149,20 @@ Function FormatGb(numberValue)
         FormatGb = CStr(CLng(roundedValue)) & " GB"
     Else
         FormatGb = CStr(roundedValue) & " GB"
+    End If
+End Function
+
+Function FormatGbPrecise(numberValue)
+    Dim roundedValue
+    If Not IsNumeric(numberValue) Then
+        FormatGbPrecise = "Unknown"
+        Exit Function
+    End If
+    roundedValue = Round(CDbl(numberValue), 2)
+    If Abs(roundedValue - Fix(roundedValue)) < 0.005 Then
+        FormatGbPrecise = CStr(CLng(roundedValue)) & " GB"
+    Else
+        FormatGbPrecise = CStr(roundedValue) & " GB"
     End If
 End Function
 
@@ -256,6 +293,40 @@ Function WifiGeneration(adapterDescription)
     Else
         WifiGeneration = ""
     End If
+End Function
+
+Function IsPhysicalNetworkAdapter(adapterObject, descriptionText)
+    Dim physicalValue, pnpIdentifier, text
+    IsPhysicalNetworkAdapter = False
+    text = LCase(Clean(descriptionText))
+
+    If InStr(text, "miniport") > 0 Or InStr(text, "packet scheduler") > 0 Or InStr(text, "loopback") > 0 Or InStr(text, "virtual") > 0 Or InStr(text, "vpn") > 0 Or InStr(text, "1394") > 0 Or InStr(text, "direct parallel") > 0 Then Exit Function
+
+    physicalValue = LCase(Clean(GetProp(adapterObject, "PhysicalAdapter")))
+    If physicalValue = "true" Or physicalValue = "-1" Then
+        IsPhysicalNetworkAdapter = True
+        Exit Function
+    End If
+
+    ' PhysicalAdapter is not consistently exposed or accurate on XP. A hardware
+    ' PnP ID is the fallback; ROOT devices are software-created adapters.
+    pnpIdentifier = UCase(Clean(GetProp(adapterObject, "PNPDeviceID")))
+    If Len(pnpIdentifier) = 0 Then Exit Function
+    If Left(pnpIdentifier, 5) = "ROOT\" Then Exit Function
+    IsPhysicalNetworkAdapter = True
+End Function
+
+Function IsPseudoOpticalDevice(deviceName, pnpIdentifier)
+    Dim text, pnpText
+    text = LCase(Clean(deviceName))
+    pnpText = UCase(Clean(pnpIdentifier))
+    IsPseudoOpticalDevice = False
+
+    If InStr(text, "virtual") > 0 Or InStr(text, "u3") > 0 Or InStr(text, "cruzer") > 0 Then
+        IsPseudoOpticalDevice = True
+        Exit Function
+    End If
+    If InStr(pnpText, "USBSTOR\CDROM&VEN_SANDISK") = 1 Then IsPseudoOpticalDevice = True
 End Function
 
 Function NormalizeIdentifier(value)
@@ -396,7 +467,8 @@ manufacturer = DisplayValue(GetProp(computer, "Manufacturer"))
 model = DisplayValue(GetProp(computer, "Model"))
 serialNumber = DisplayValue(GetProp(bios, "SerialNumber"))
 computerName = DisplayValue(GetProp(computer, "Name"))
-processorText = DisplayValue(GetProp(processor, "Name"))
+processorText = ReadRegistryText(shell, "HKLM\HARDWARE\DESCRIPTION\System\CentralProcessor\0\ProcessorNameString")
+If Len(processorText) = 0 Then processorText = DisplayValue(GetProp(processor, "Name"))
 osText = DisplayValue(GetProp(operatingSystem, "Caption"))
 If Len(Clean(GetProp(operatingSystem, "Version"))) > 0 Then
     osText = osText & " " & Clean(GetProp(operatingSystem, "Version"))
@@ -464,6 +536,13 @@ Else
 End If
 If totalModuleGb > 0 Then
     installedRamText = FormatGb(totalModuleGb)
+    usableRamBytes = GetProp(computer, "TotalPhysicalMemory")
+    If IsNumeric(usableRamBytes) Then
+        If CDbl(usableRamBytes) > 0 And CDbl(usableRamBytes) < ((totalModuleGb * GB) - (256 * 1024 * 1024)) Then
+            usableRamText = FormatGbPrecise(CDbl(usableRamBytes) / GB)
+            installedRamText = installedRamText & " installed / " & usableRamText & " usable by Windows XP"
+        End If
+    End If
 ElseIf IsNumeric(GetProp(computer, "TotalPhysicalMemory")) Then
     installedRamText = FormatGb(CDbl(GetProp(computer, "TotalPhysicalMemory")) / GB)
 Else
@@ -545,7 +624,7 @@ Set opticalDevices = QuerySafe(cim, "SELECT Name, PNPDeviceID FROM Win32_CDROMDr
 If Not opticalDevices Is Nothing Then
     For Each item In opticalDevices
         pnpName = Clean(GetProp(item, "Name"))
-        If InStr(LCase(pnpName), "virtual") = 0 Then
+        If Not IsPseudoOpticalDevice(pnpName, GetProp(item, "PNPDeviceID")) Then
             opticalCount = opticalCount + 1
             If Len(opticalRows) > 0 Then opticalRows = opticalRows & ", "
             opticalRows = opticalRows & pnpName
@@ -566,12 +645,12 @@ If Not networkAdapters Is Nothing Then
         networkName = Clean(GetProp(item, "NetConnectionID"))
         If Len(networkName) = 0 Then networkName = Clean(GetProp(item, "Name"))
         networkText = LCase(networkName & " " & Clean(GetProp(item, "Description")))
-        If Len(Clean(GetProp(item, "MACAddress"))) > 0 Then
+        If IsPhysicalNetworkAdapter(item, networkText) Then
             If InStr(networkText, "wireless") > 0 Or InStr(networkText, "wi-fi") > 0 Or InStr(networkText, "wifi") > 0 Or InStr(networkText, "802.11") > 0 Then
                 If Len(WifiGeneration(networkText)) > 0 Then wifiStatus = WifiGeneration(networkText)
             Else
                 adapterType = LCase(Clean(GetProp(item, "AdapterType")))
-                If InStr(adapterType, "ethernet") > 0 And InStr(networkText, "bluetooth") = 0 And InStr(networkText, "virtual") = 0 And InStr(networkText, "vpn") = 0 Then
+                If InStr(adapterType, "ethernet") > 0 And InStr(networkText, "bluetooth") = 0 Then
                     adapterSpeed = FormatLinkSpeed(GetProp(item, "Speed"))
                     adapterState = GetProp(item, "NetConnectionStatus")
                     If WmiInteger(adapterState) >= 0 Then

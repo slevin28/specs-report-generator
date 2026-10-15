@@ -23,3 +23,9 @@ System Volume Information/
 # Local editor files.
 *.swp
 *.tmp
+
+# Ubuntu report output and Python test caches.
+Reports/
+system-specs_*.html
+system-specs_*.json
+__pycache__/
